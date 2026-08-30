@@ -1,0 +1,39 @@
+[project]
+name = "Wuppo"
+version = "0.1.0"
+description = "Wuppo"
+readme = "README.md"
+requires-python = ">=3.10, <4.0"
+
+dependencies = [
+    "nonebot2[aiohttp]>=2.5.0",
+    "nonebot-adapter-qq>=1.7.0",
+    "nonebot-adapter-discord>=1.1.9",
+]
+
+
+[tool.nonebot]
+plugin_dirs = []
+builtin_plugins = []
+
+
+[tool.nonebot.adapters]
+
+nonebot-adapter-qq = [
+    { name = "QQ", module_name = "nonebot.adapters.qq" }
+]
+
+nonebot-adapter-discord = [
+    { name = "Discord", module_name = "nonebot.adapters.discord" }
+]
+
+
+[tool.nonebot.plugins]
+
+"@local" = []
+
+
+[tool.setuptools.packages.find]
+
+include = ["plugins*"]
+exclude = ["data*"]

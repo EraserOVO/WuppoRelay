@@ -1,0 +1,9 @@
+﻿.venv/
+__pycache__/
+*.pyc
+data/logs/
+backup/
+测试内容/
+.env.prod
+.zcode/
+*.egg-info/

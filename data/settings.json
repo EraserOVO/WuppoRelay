@@ -1,0 +1,42 @@
+{
+  "qq_group_openids": [
+    {
+      "openid": "C206FC38640F9A3CCE072C9797FAED43",
+      "enabled": true,
+      "remark": " 测试群聊 1061402566"
+    },
+    {
+      "openid": "97F1D3D06CE25D98A6EA48CA8A540089",
+      "enabled": false,
+      "remark": " 乌姆之家 wuppo 902279815"
+    },
+    {
+      "openid": "6E8660F511F527F46325230F0D8B76B0",
+      "enabled": false,
+      "remark": " 波波城 wuppo 983389173"
+    }
+  ],
+  "discord_channels": [
+    {
+      "id": "1525802021582540822",
+      "name": "测试频道消息",
+      "enabled": true
+    },
+    {
+      "id": "1428025029290889318",
+      "name": "MLD新闻",
+      "enabled": false
+    },
+    {
+      "id": "222730696786051073",
+      "name": "snekflat新闻",
+      "enabled": false
+    },
+    {
+      "id": "1246134049123336252",
+      "name": "TTTT新闻",
+      "enabled": false
+    }
+  ],
+  "mode": "test"
+}
