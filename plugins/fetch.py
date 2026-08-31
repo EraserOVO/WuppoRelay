@@ -70,6 +70,59 @@ def is_discord_url(text):
 # REST 抓取（按链接拉单条消息）
 # =====================================================
 
+def normalize_api_message(msg):
+    """Discord API 消息对象 → 规范化 dict（含 message_id）
+
+    供 fetch_message / fetch_channel_messages_after 复用。
+    结构：{message_id, username, channel_id, channel_name, content, embeds, attachments}
+    embeds: [{title, url, image_url}]
+    attachments: [{url, filename}]"""
+    author = msg.get(
+        "author",
+        {}
+    ) or {}
+
+    username = (
+        author.get("global_name")
+        or author.get("username")
+        or "unknown"
+    )
+
+    embeds = []
+    for embed in msg.get("embeds") or []:
+        if not isinstance(embed, dict):
+            continue
+        image = embed.get("image") or {}
+        image_url = image.get("url") if isinstance(image, dict) else None
+        embeds.append({
+            "title": embed.get("title"),
+            "url": embed.get("url"),
+            "image_url": image_url,
+        })
+
+    attachments = []
+    for att in msg.get("attachments") or []:
+        if not isinstance(att, dict):
+            continue
+        url = att.get("url")
+        if not url:
+            continue
+        attachments.append({
+            "url": url,
+            "filename": att.get("filename", ""),
+        })
+
+    return {
+        "message_id": str(msg.get("id") or ""),
+        "username": username,
+        "channel_id": str(msg.get("channel_id") or ""),
+        "channel_name": None,
+        "content": msg.get("content", ""),
+        "embeds": embeds,
+        "attachments": attachments,
+    }
+
+
 async def fetch_message(url):
     """按链接抓取 Discord 单条消息，返回规范化消息 dict；失败返回 None
 
@@ -118,51 +171,97 @@ async def fetch_message(url):
         )
         return None
 
-    msg = response.json()
-
-    author = msg.get(
-        "author",
-        {}
-    ) or {}
-
-    username = (
-        author.get("global_name")
-        or author.get("username")
-        or "unknown"
+    message = normalize_api_message(
+        response.json()
     )
 
-    embeds = []
-    for embed in msg.get("embeds") or []:
-        if not isinstance(embed, dict):
-            continue
-        image = embed.get("image") or {}
-        image_url = image.get("url") if isinstance(image, dict) else None
-        embeds.append({
-            "title": embed.get("title"),
-            "url": embed.get("url"),
-            "image_url": image_url,
-        })
+    # 链接解析出的频道 ID 为准（与 API 返回应一致，保险起见覆盖）
+    message["channel_id"] = channel_id
 
-    attachments = []
-    for att in msg.get("attachments") or []:
-        if not isinstance(att, dict):
-            continue
-        url = att.get("url")
-        if not url:
-            continue
-        attachments.append({
-            "url": url,
-            "filename": att.get("filename", ""),
-        })
+    return message
 
-    return {
-        "username": username,
-        "channel_id": channel_id,
-        "channel_name": None,
-        "content": msg.get("content", ""),
-        "embeds": embeds,
-        "attachments": attachments,
+
+async def fetch_channel_messages_after(channel_id, after_id, limit=10):
+    """抓取频道中 after_id 之后的消息，返回最旧的 limit 条（时间正序 旧→新）
+
+    Discord API 单页上限 100 条且按 id 倒序返回，因此翻页到底收集全部
+    缺口后取最旧 limit 条，保证补发从旧消息开始、不丢旧消息。
+    失败返回 []"""
+    if limit <= 0:
+        return []
+
+    page_limit = 100
+
+    headers = {
+        "Authorization":
+            f"Bot {get_discord_token()}"
     }
+
+    collected = []
+    before = None
+
+    while True:
+
+        api = (
+            f"https://discord.com/api/v10/"
+            f"channels/{channel_id}/messages"
+            f"?after={after_id}&limit={page_limit}"
+        )
+
+        if before:
+            api += f"&before={before}"
+
+        try:
+            async with httpx.AsyncClient(
+                proxy=_get_proxy(),
+                timeout=DISCORD_API_TIMEOUT,
+            ) as client:
+                response = await client.get(
+                    api,
+                    headers=headers,
+                )
+        except Exception as exc:
+            logger.warning(
+                "Discord API请求异常: {}",
+                exc
+            )
+            break
+
+        if response.status_code != 200:
+            logger.warning(
+                "Discord API错误: {} {}",
+                response.status_code,
+                response.text
+            )
+            break
+
+        data = response.json()
+
+        if not isinstance(data, list) or not data:
+            break
+
+        collected.extend(data)
+
+        if len(data) < page_limit:
+            break
+
+        # 本页取满，翻页取更早的（仍晚于 after_id）消息
+        before = str(data[-1].get("id") or "")
+
+        if not before:
+            break
+
+    if not collected:
+        return []
+
+    # 全部缺口（新→旧），反转成旧→新后取最旧 limit 条
+    messages = [
+        normalize_api_message(msg)
+        for msg in collected
+    ]
+    messages.reverse()
+
+    return messages[:limit]
 
 
 async def fetch_channel_latest(channel_id):
@@ -209,53 +308,73 @@ async def fetch_channel_latest(channel_id):
     return str(data[0].get("id") or "")
 
 
-async def fetch_channel_after_count(channel_id, after_id, limit=100):
-    """统计频道里 after_id 之后的消息条数（最多统计 limit 条；
-    超过时返回 limit + 1 表示“至少 limit 条”）；失败返回 0"""
-    api = (
-        f"https://discord.com/api/v10/"
-        f"channels/{channel_id}/messages"
-        f"?after={after_id}&limit={limit}"
-    )
+async def fetch_channel_gap_count(channel_id, after_id, cap=1000):
+    """统计频道中 after_id 之后的消息条数（最多统计 cap 条，
+    超过时返回 cap 表示"至少 cap 条"）；失败返回 None"""
+    page_limit = 100
 
     headers = {
         "Authorization":
             f"Bot {get_discord_token()}"
     }
 
-    try:
-        async with httpx.AsyncClient(
-            proxy=_get_proxy(),
-            timeout=DISCORD_API_TIMEOUT,
-        ) as client:
-            response = await client.get(
-                api,
-                headers=headers,
+    total = 0
+    before = None
+
+    while True:
+
+        api = (
+            f"https://discord.com/api/v10/"
+            f"channels/{channel_id}/messages"
+            f"?after={after_id}&limit={page_limit}"
+        )
+
+        if before:
+            api += f"&before={before}"
+
+        try:
+            async with httpx.AsyncClient(
+                proxy=_get_proxy(),
+                timeout=DISCORD_API_TIMEOUT,
+            ) as client:
+                response = await client.get(
+                    api,
+                    headers=headers,
+                )
+        except Exception as exc:
+            logger.warning(
+                "Discord API请求异常: {}",
+                exc
             )
-    except Exception as exc:
-        logger.warning(
-            "Discord API请求异常: %s",
-            exc
-        )
-        return 0
+            return None
 
-    if response.status_code != 200:
-        logger.warning(
-            "Discord API错误: %s %s",
-            response.status_code,
-            response.text
-        )
-        return 0
+        if response.status_code != 200:
+            logger.warning(
+                "Discord API错误: {} {}",
+                response.status_code,
+                response.text
+            )
+            return None
 
-    data = response.json()
+        data = response.json()
 
-    if not isinstance(data, list):
-        return 0
+        if not isinstance(data, list) or not data:
+            break
 
-    if len(data) >= limit:
-        return limit + 1
+        total += len(data)
 
-    return len(data)
+        if total >= cap:
+            return cap
+
+        if len(data) < page_limit:
+            break
+
+        before = str(data[-1].get("id") or "")
+
+        if not before:
+            break
+
+    return total
 
 
 # =====================================================
@@ -312,13 +431,14 @@ def normalize_event(event, channel_name):
 # 规范化消息 → QQ 消息段（唯一一份渲染逻辑）
 # =====================================================
 
-async def build_parts(message):
+async def build_parts(message, source_label="自动转发来自"):
     """规范化消息 → (text_parts, media_items, has_content)
 
     - header（来源频道/作者）始终在 text_parts 首位
     - 正文 + Emoji、embeds、附件统一渲染，媒体并发下载
     - 下载失败降级为文字 + 原链接
-    - has_content 用于实时转发跳过空消息（仅 header 时）"""
+    - has_content 用于实时转发跳过空消息（仅 header 时）
+    - source_label 区分消息来源（实时转发 / 启动补发）"""
     text_parts = []
     media_items = []
 
@@ -327,7 +447,7 @@ async def build_parts(message):
 
     text_parts.append(
         make_text(
-            f"自动转发来自\n"
+            f"{source_label}\n"
             f"Discord [#{channel_name}] 中 [{username}]的消息："
         )
     )

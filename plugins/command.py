@@ -12,7 +12,6 @@ from nonebot.adapters.qq.event import (
 
 from plugins.config import (
     get_active_groups,
-    get_allowed_users,
     DISCORD_CHANNELS,
 )
 from plugins.fetch import (
@@ -179,27 +178,6 @@ async def handle(
     if not content:
 
         return
-
-
-    # 私聊转发白名单（settings.json 的 allowed_users，留空 = 不限制）
-    allowed = get_allowed_users()
-
-    if allowed:
-
-        user_openid = getattr(
-            event,
-            "user_openid",
-            ""
-        ) or ""
-
-        if user_openid not in allowed:
-
-            await bot.send(
-                event,
-                "你没有使用转发功能的权限"
-            )
-
-            return
 
 
     logger.info(

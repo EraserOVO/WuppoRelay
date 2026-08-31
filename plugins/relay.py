@@ -1,6 +1,3 @@
-import asyncio
-
-from nonebot import get_driver
 from nonebot import logger
 from nonebot import on_message
 from nonebot.adapters import Event
@@ -19,8 +16,6 @@ from plugins.history import (
 from plugins.fetch import (
     normalize_event,
     build_parts,
-    fetch_channel_latest,
-    fetch_channel_after_count,
 )
 from plugins.sender import send_relay_message
 from plugins.stats import record
@@ -185,97 +180,7 @@ async def handle(
 
 
 # =====================================================
-# 离线消息丢失提示（B5）
-#
-# 机器人每次连接时，对比每个启用频道的最新消息 ID 与已记录 ID，
-# 发现缺口只输出警告日志（绝不补发任何消息），
-# 提示离线期间可能丢失了多少条。
+# 离线消息丢失提示（B5）已移除：
+# 启动历史补发由 plugins/backfill.py 承担（连接后逐条补发缺口消息），
+# 不再只告警不补发。
 # =====================================================
-
-driver = get_driver()
-
-
-@driver.on_bot_connect
-async def _check_missed_wrapper(bot):
-
-    if isinstance(
-        bot,
-        DiscordBot
-    ):
-        asyncio.create_task(
-            _report_missed()
-        )
-
-
-async def _report_missed():
-
-    try:
-
-        channels = get_active_channels()
-
-        last_messages = load_last_messages()
-
-        for channel_id, channel_name in channels.items():
-
-            try:
-
-                channel_map = last_messages.get(
-                    channel_id
-                )
-
-                if isinstance(channel_map, dict):
-                    ids = [
-                        value
-                        for value in channel_map.values()
-                        if value
-                    ]
-                    last_id = max(ids) if ids else None
-                else:
-                    last_id = channel_map
-
-                if not last_id:
-                    continue
-
-                latest = await fetch_channel_latest(
-                    channel_id
-                )
-
-                if (
-                    not latest
-                    or int(latest) <= int(last_id)
-                ):
-                    continue
-
-                count = await fetch_channel_after_count(
-                    channel_id,
-                    last_id
-                )
-
-                if not count:
-                    continue
-
-                if count > 100:
-                    note = f"至少 {count - 1} 条"
-                else:
-                    note = f"{count} 条"
-
-                logger.warning(
-                    "频道[%s]离线期间可能丢失%s消息（最后记录=%s，最新=%s），未自动补发",
-                    channel_name,
-                    note,
-                    last_id,
-                    latest
-                )
-
-            except Exception:
-
-                logger.exception(
-                    "检查离线消息失败: %s",
-                    channel_id
-                )
-
-    except Exception:
-
-        logger.exception(
-            "离线消息检查失败"
-        )
