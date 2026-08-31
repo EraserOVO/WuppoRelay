@@ -93,7 +93,7 @@ async def _backfill_missed():
             except Exception:
 
                 logger.exception(
-                    "启动补发失败: %s",
+                    "启动补发失败: {}",
                     channel_id
                 )
 

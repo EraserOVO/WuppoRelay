@@ -110,7 +110,7 @@ async def _send_with_retry(qq_bot, group_openid, message):
             last_error = exc
 
             logger.warning(
-                "发送失败(第%s次): %s %s",
+                "发送失败(第{}次): {} {}",
                 attempt,
                 group_openid,
                 exc
@@ -136,7 +136,7 @@ async def _send_with_retry(qq_bot, group_openid, message):
 
     # 全部尝试失败：error 级别汇总，面板日志中更醒目
     logger.error(
-        "发送失败已达上限(%s次)%s: %s %s",
+        "发送失败已达上限({}次){}: {} {}",
         MAX_SEND_ATTEMPTS,
         "（限流）" if rate_limited else "（非限流）",
         group_openid,
@@ -233,7 +233,7 @@ async def send_media_items(qq_bot, groups, media_items):
 
         # 重试后仍失败：降级为链接
         logger.warning(
-            "富媒体上传失败，降级为链接: %s",
+            "富媒体上传失败，降级为链接: {}",
             item["kind"]
         )
 

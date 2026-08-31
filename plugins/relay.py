@@ -107,7 +107,7 @@ async def handle(
     if not target_groups:
 
         logger.debug(
-            "跳过旧消息: %s",
+            "跳过旧消息: {}",
             message_id
         )
 
@@ -165,7 +165,7 @@ async def handle(
         )
 
         logger.info(
-            "记录Discord消息: %s %s",
+            "记录Discord消息: {} {}",
             channel_id,
             message_id
         )
@@ -173,7 +173,7 @@ async def handle(
     else:
 
         logger.warning(
-            "Discord消息发送失败，不记录去重ID（重连补发时会重试）: %s %s",
+            "Discord消息发送失败，不记录去重ID（重连补发时会重试）: {} {}",
             channel_id,
             message_id
         )

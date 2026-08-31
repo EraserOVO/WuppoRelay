@@ -297,7 +297,7 @@ async def fetch_bytes(url):
                 async with client.stream("GET", url) as resp:
                     if resp.status_code != 200:
                         logger.warning(
-                            "媒体下载失败: %s %s",
+                            "媒体下载失败: {} {}",
                             resp.status_code,
                             url
                         )
@@ -310,7 +310,7 @@ async def fetch_bytes(url):
                         and int(length) > max_bytes
                     ):
                         logger.warning(
-                            "媒体超过大小上限(%s>%s)，放弃下载: %s",
+                            "媒体超过大小上限({}>{})，放弃下载: {}",
                             length,
                             max_bytes,
                             url
@@ -322,14 +322,14 @@ async def fetch_bytes(url):
                         data.extend(chunk)
                         if len(data) > max_bytes:
                             logger.warning(
-                                "媒体超过大小上限，放弃下载: %s",
+                                "媒体超过大小上限，放弃下载: {}",
                                 url
                             )
                             return None
                     return bytes(data)
     except Exception as exc:
         logger.warning(
-            "媒体下载异常: %s",
+            "媒体下载异常: {}",
             exc
         )
         return None
