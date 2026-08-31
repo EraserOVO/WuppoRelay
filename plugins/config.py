@@ -78,6 +78,7 @@ def _default_settings():
     ]
     return {
         "qq_group_openids": groups,
+        "qq_user_openids": [],
         "discord_channels": channels,
         "backfill_enabled": True,
         "backfill_limit": 10,
@@ -85,7 +86,8 @@ def _default_settings():
 
 
 def _ensure_settings_file():
-    """settings.json 缺失/损坏/结构不完整时，用默认值自动生成，
+    """settings.json 缺失/损坏/结构不完整时，用默认值自动生成；
+    结构完整但缺少新增字段时只补齐该字段，不重置已有配置，
     保证运行时配置始终落在 settings.json，避免与 config.py 默认值各说各话。"""
     data = load_json(
         SETTINGS_FILE,
@@ -96,6 +98,14 @@ def _ensure_settings_file():
         and isinstance(data.get("qq_group_openids"), list)
         and isinstance(data.get("discord_channels"), list)
     ):
+        # 结构完整：仅补齐缺失的新增字段（qq_user_openids）
+        if not isinstance(data.get("qq_user_openids"), list):
+            data["qq_user_openids"] = []
+            atomic_write_json(
+                SETTINGS_FILE,
+                data,
+                indent=2
+            )
         return
 
     atomic_write_json(
@@ -149,6 +159,14 @@ def _load_settings():
             SETTINGS_FILE,
             default=None
         )
+    elif not isinstance(data.get("qq_user_openids"), list):
+        # 结构完整但缺少新增字段：只补齐，不重置已有配置
+        data["qq_user_openids"] = []
+        atomic_write_json(
+            SETTINGS_FILE,
+            data,
+            indent=2
+        )
 
     _settings_cache = data if isinstance(data, dict) else _default_settings()
     _settings_cache_mtime, _settings_cache_size = mtime, size
@@ -186,6 +204,38 @@ def get_active_groups():
                 active.append(str(item["openid"]))
         return active
     return list(QQ_GROUP_OPENIDS)
+
+
+def get_all_channels():
+    """返回设置文件中全部 Discord 频道 {频道ID: 名称}（不论是否启用）
+
+    供私聊 relay 链接模式补频道显示名：链接指向的频道可能未启用，
+    也要能显示面板配置的名字。缺失/损坏时回退默认值（空 dict）。"""
+    data = _load_settings()
+    items = data.get("discord_channels")
+    if isinstance(items, list):
+        all_channels = {}
+        for item in items:
+            if item.get("id"):
+                all_channels[str(item["id"])] = str(item.get("name") or "")
+        return all_channels
+    return dict(DISCORD_CHANNELS)
+
+
+def get_active_user_openids():
+    """返回当前启用（允许私聊 relay）的 QQ 用户 openid 列表
+
+    设置文件中存在用户列表时，按勾选状态返回；缺失/损坏时返回空列表
+    （默认所有人不可用，需在管理面板勾选放行）。"""
+    data = _load_settings()
+    items = data.get("qq_user_openids")
+    if isinstance(items, list):
+        active = []
+        for item in items:
+            if item.get("enabled") and item.get("openid"):
+                active.append(str(item["openid"]))
+        return active
+    return []
 
 
 def get_backfill_limit():
