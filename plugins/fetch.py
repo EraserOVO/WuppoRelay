@@ -124,15 +124,16 @@ def normalize_api_message(msg):
 
 
 async def fetch_message(url):
-    """按链接抓取 Discord 单条消息，返回规范化消息 dict；失败返回 None
+    """按链接抓取 Discord 单条消息，返回 (规范化消息 dict, 失败原因 or None)
 
+    失败时消息为 None，原因可用于提示用户（如 HTTP 403/404/429）。
     规范化结构：{username, channel_id, channel_name, content, embeds, attachments}
     embeds: [{title, url, image_url}]
     attachments: [{url, filename}]"""
     data = parse_discord_url(url)
 
     if not data:
-        return None
+        return None, "链接格式无法解析"
 
     channel_id = data["channel_id"]
     message_id = data["message_id"]
@@ -158,18 +159,18 @@ async def fetch_message(url):
             )
     except Exception as exc:
         logger.warning(
-            "Discord API请求异常: %s",
+            "Discord API请求异常: {}",
             exc
         )
-        return None
+        return None, "请求异常"
 
     if response.status_code != 200:
         logger.warning(
-            "Discord API错误: %s %s",
+            "Discord API错误: {} {}",
             response.status_code,
             response.text
         )
-        return None
+        return None, f"HTTP {response.status_code}"
 
     message = normalize_api_message(
         response.json()
@@ -178,7 +179,7 @@ async def fetch_message(url):
     # 链接解析出的频道 ID 为准（与 API 返回应一致，保险起见覆盖）
     message["channel_id"] = channel_id
 
-    return message
+    return message, None
 
 
 async def fetch_channel_messages_after(channel_id, after_id, limit=10):
@@ -287,14 +288,14 @@ async def fetch_channel_latest(channel_id):
             )
     except Exception as exc:
         logger.warning(
-            "Discord API请求异常: %s",
+            "Discord API请求异常: {}",
             exc
         )
         return None
 
     if response.status_code != 200:
         logger.warning(
-            "Discord API错误: %s %s",
+            "Discord API错误: {} {}",
             response.status_code,
             response.text
         )
@@ -306,6 +307,49 @@ async def fetch_channel_latest(channel_id):
         return None
 
     return str(data[0].get("id") or "")
+
+
+async def fetch_channel_name(channel_id):
+    """REST 获取频道名称；失败返回 None"""
+    api = f"https://discord.com/api/v10/channels/{channel_id}"
+
+    headers = {
+        "Authorization":
+            f"Bot {get_discord_token()}"
+    }
+
+    try:
+        async with httpx.AsyncClient(
+            proxy=_get_proxy(),
+            timeout=DISCORD_API_TIMEOUT,
+        ) as client:
+            response = await client.get(
+                api,
+                headers=headers,
+            )
+    except Exception as exc:
+        logger.warning(
+            "Discord API请求异常: {}",
+            exc
+        )
+        return None
+
+    if response.status_code != 200:
+        logger.warning(
+            "Discord API错误: {} {}",
+            response.status_code,
+            response.text
+        )
+        return None
+
+    data = response.json()
+
+    if not isinstance(data, dict):
+        return None
+
+    name = data.get("name")
+
+    return str(name) if name else None
 
 
 async def fetch_channel_gap_count(channel_id, after_id, cap=1000):
@@ -428,6 +472,29 @@ def normalize_event(event, channel_name):
 
 
 # =====================================================
+# 频道显示名解析（带进程内缓存）
+#
+# 实时转发/补发/私聊链接共用同一兜底：配置里没填名字时
+# 查一次 Discord API 真实名并缓存，避免高频路径每条消息
+# 都请求一次 Discord。
+# =====================================================
+
+_channel_name_cache = {}
+
+
+async def _resolve_channel_name(channel_id):
+    """查 Discord 真实频道名，进程内缓存；失败返回 None（调用方回退 ID）"""
+    if channel_id in _channel_name_cache:
+        return _channel_name_cache[channel_id]
+
+    name = await fetch_channel_name(channel_id)
+
+    _channel_name_cache[channel_id] = name
+
+    return name
+
+
+# =====================================================
 # 规范化消息 → QQ 消息段（唯一一份渲染逻辑）
 # =====================================================
 
@@ -442,7 +509,14 @@ async def build_parts(message, source_label="自动转发来自"):
     text_parts = []
     media_items = []
 
-    channel_name = message.get("channel_name") or message.get("channel_id") or "?"
+    channel_name = message.get("channel_name") or ""
+    channel_id = message.get("channel_id") or ""
+
+    if not channel_name and channel_id:
+        # 未配置显示名时兜底：查 Discord API 真实名（每频道缓存一次）
+        channel_name = await _resolve_channel_name(channel_id)
+
+    channel_name = channel_name or channel_id or "?"
     username = message.get("username") or "unknown"
 
     text_parts.append(
