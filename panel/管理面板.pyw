@@ -47,8 +47,9 @@ BOT_PORT = 8082
 # 测试模式：仅启用测试群 + 测试频道
 # 转发模式：启用除测试群/频道以外的全部群聊与频道
 # 自定义模式：其它任意勾选组合
-TEST_GROUP_OPENID = "C206FC38640F9A3CCE072C9797FAED43"
-TEST_CHANNEL_ID = "1525802021582540822"
+#
+# 测试群/频道 ID 不硬编码，从 data/settings.json 读取：
+#   test_group_openid / test_channel_id（可分发；未配置时测试/转发模式不可用）
 
 # ---------------- 开机自启 ----------------
 # 通过启动文件夹里的 WuppoRelayAutostart.vbs（隐藏窗口）运行 panel/autostart.pyw，
@@ -98,7 +99,15 @@ def get_default_settings():
     try:
         from plugins.config import DISCORD_CHANNELS, QQ_GROUP_OPENIDS
     except Exception:
-        return {"qq_group_openids": [], "discord_channels": []}
+        return {
+            "qq_group_openids": [],
+            "discord_channels": [],
+            "backfill_enabled": True,
+            "backfill_limit": 10,
+            "test_group_openid": "",
+            "test_channel_id": "",
+            "qq_appid": "",
+        }
     groups = [
         {"openid": str(o), "enabled": True, "remark": ""}
         for o in QQ_GROUP_OPENIDS
@@ -107,7 +116,15 @@ def get_default_settings():
         {"id": str(k), "name": v, "enabled": True}
         for k, v in DISCORD_CHANNELS.items()
     ]
-    return {"qq_group_openids": groups, "discord_channels": channels, "allowed_users": []}
+    return {
+        "qq_group_openids": groups,
+        "discord_channels": channels,
+        "backfill_enabled": True,
+        "backfill_limit": 10,
+        "test_group_openid": "",
+        "test_channel_id": "",
+        "qq_appid": "",
+    }
 
 
 def save_settings(data):
@@ -118,22 +135,42 @@ def save_settings(data):
     os.replace(tmp, SETTINGS_FILE)
 
 
+def get_test_ids():
+    """返回 (test_group_openid, test_channel_id)；未配置返回 (None, None)"""
+    data = load_settings()
+    gid = str(data.get("test_group_openid") or "").strip()
+    cid = str(data.get("test_channel_id") or "").strip()
+    return (gid or None), (cid or None)
+
+
+def get_qq_appid():
+    """返回 QQ 开放平台 AppID（settings.json 的 qq_appid）；未配置返回 "" """
+    data = load_settings()
+    return str(data.get("qq_appid") or "").strip()
+
+
 def classify_mode(data):
-    """根据 settings 的勾选状态判断当前组合匹配哪种预设（状态推导）"""
+    """根据 settings 的勾选状态判断当前组合匹配哪种预设（状态推导）；
+    未配置测试群/频道时无法匹配测试/转发预设，一律视为自定义"""
     groups = data.get("qq_group_openids", [])
     channels = data.get("discord_channels", [])
+
+    test_group, test_channel = get_test_ids()
+
+    if not test_group or not test_channel:
+        return "custom"
 
     enabled_g = {str(g.get("openid")) for g in groups if g.get("enabled")}
     enabled_c = {str(c.get("id")) for c in channels if c.get("enabled")}
 
-    if enabled_g == {TEST_GROUP_OPENID} and enabled_c == {TEST_CHANNEL_ID}:
+    if enabled_g == {test_group} and enabled_c == {test_channel}:
         return "test"
 
     known_g = {str(g.get("openid")) for g in groups}
     known_c = {str(c.get("id")) for c in channels}
     if (
-        enabled_g == known_g - {TEST_GROUP_OPENID}
-        and enabled_c == known_c - {TEST_CHANNEL_ID}
+        enabled_g == known_g - {test_group}
+        and enabled_c == known_c - {test_channel}
     ):
         return "forward"
 
@@ -154,21 +191,34 @@ def effective_mode(data):
 def apply_mode(mode):
     """应用模式预设，返回 (ok, msg, settings)
     - test / forward：改勾选组合，并记录所选模式
+      （未配置测试群/频道时 test 不可用，forward 退化为全部启用）
     - custom：不改勾选组合，仅记录为自定义模式
     """
     data = load_settings()
 
+    test_group, test_channel = get_test_ids()
+
     if mode == "test":
+        if not test_group or not test_channel:
+            return (
+                False,
+                "未配置测试群/频道（settings.json 的 test_group_openid / test_channel_id）",
+                data,
+            )
         for g in data["qq_group_openids"]:
-            g["enabled"] = (str(g.get("openid")) == TEST_GROUP_OPENID)
+            g["enabled"] = (str(g.get("openid")) == test_group)
         for c in data["discord_channels"]:
-            c["enabled"] = (str(c.get("id")) == TEST_CHANNEL_ID)
+            c["enabled"] = (str(c.get("id")) == test_channel)
         data["mode"] = "test"
     elif mode == "forward":
         for g in data["qq_group_openids"]:
-            g["enabled"] = (str(g.get("openid")) != TEST_GROUP_OPENID)
+            g["enabled"] = (
+                (str(g.get("openid")) != test_group) if test_group else True
+            )
         for c in data["discord_channels"]:
-            c["enabled"] = (str(c.get("id")) != TEST_CHANNEL_ID)
+            c["enabled"] = (
+                (str(c.get("id")) != test_channel) if test_channel else True
+            )
         data["mode"] = "forward"
     elif mode == "custom":
         # 自定义模式不做任何勾选改动，仅记录选择
@@ -519,6 +569,37 @@ def current_log_level():
         return ""
 
 
+# ---------------- bot HTTP 转发（面板 -> bot 8082） ----------------
+# bot 的 NoneBot FastAPI 运行在 127.0.0.1:8082，补发相关查询/操作
+# （待补发数量、手动补发、清除待补发）由 bot 进程完成，面板只做转发。
+BOT_API_BASE = "http://127.0.0.1:%d" % BOT_PORT
+
+
+def bot_api_get(path, timeout=10.0):
+    """GET bot HTTP 端点，返回 dict；bot 不可用时返回 None"""
+    import urllib.request
+    try:
+        with urllib.request.urlopen(BOT_API_BASE + path, timeout=timeout) as resp:
+            return json.loads(resp.read().decode("utf-8"))
+    except Exception:
+        return None
+
+
+def bot_api_post(path, timeout=30.0):
+    """POST bot HTTP 端点（无请求体），返回 dict；bot 不可用时返回 None"""
+    import urllib.request
+    try:
+        req = urllib.request.Request(
+            BOT_API_BASE + path,
+            data=b"",
+            method="POST",
+        )
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            return json.loads(resp.read().decode("utf-8"))
+    except Exception:
+        return None
+
+
 # ---------------- FastAPI 面板 ----------------
 from fastapi import FastAPI, Request
 from fastapi.responses import HTMLResponse, JSONResponse
@@ -540,7 +621,11 @@ async def origin_guard(request: Request, call_next):
     origin = request.headers.get("origin")
     if origin and origin != ALLOWED_ORIGIN:
         return JSONResponse({"ok": False, "msg": "Forbidden"}, status_code=403)
-    return await call_next(request)
+    response = await call_next(request)
+    # 面板是本地单页应用，禁止浏览器缓存页面/接口，
+    # 否则改版后浏览器仍显示旧页面（曾导致"机器人状态检测中…"残留）
+    response.headers["Cache-Control"] = "no-store"
+    return response
 
 
 @app.get("/", response_class=HTMLResponse)
@@ -566,6 +651,11 @@ def api_status():
 @app.get("/api/settings")
 def api_settings():
     return load_settings()
+
+
+@app.get("/api/settings/default")
+def api_settings_default():
+    return get_default_settings()
 
 
 @app.post("/api/settings/save")
@@ -675,6 +765,39 @@ def api_bot_log_clear():
         return {"ok": False, "msg": str(exc)}
 
 
+# ---------------- 离线补发（转发到 bot 8082） ----------------
+@app.get("/api/backfill/pending")
+def api_backfill_pending():
+    running = bot_status()["running"]
+    if not running:
+        return {"ok": False, "running": False, "msg": "机器人未运行"}
+    data = bot_api_get("/api/backfill/pending")
+    if data is None:
+        return {"ok": False, "running": True, "msg": "bot 接口不可用"}
+    data["running"] = True
+    return data
+
+
+@app.post("/api/backfill/run")
+def api_backfill_run():
+    if not bot_status()["running"]:
+        return {"ok": False, "msg": "机器人未运行"}
+    data = bot_api_post("/api/backfill/run")
+    if data is None:
+        return {"ok": False, "msg": "bot 接口不可用"}
+    return data
+
+
+@app.post("/api/backfill/clear")
+def api_backfill_clear():
+    if not bot_status()["running"]:
+        return {"ok": False, "msg": "机器人未运行"}
+    data = bot_api_post("/api/backfill/clear")
+    if data is None:
+        return {"ok": False, "msg": "bot 接口不可用"}
+    return data
+
+
 # ---------------- 页面 ----------------
 PAGE_HTML = """<!DOCTYPE html>
 <html lang="zh-CN">
@@ -695,7 +818,7 @@ PAGE_HTML = """<!DOCTYPE html>
     background: #272c35; border-radius: 10px;
     padding: 16px 18px; margin-bottom: 16px;
   }
-  .card h2 { font-size: 15px; margin: 0 0 12px; color: #9fd0ff; }
+  .card h2 { font-size: 15px; margin: 0 0 12px; color: #aeb6ff; }
   .row { display: flex; align-items: center; gap: 12px; flex-wrap: wrap; }
   .badge {
     padding: 4px 12px; border-radius: 20px; font-size: 13px; font-weight: bold;
@@ -704,15 +827,16 @@ PAGE_HTML = """<!DOCTYPE html>
   .badge.off { background: #6b3b3b; color: #ffc9c9; }
   .pid { font-size: 13px; color: #8b93a1; }
   button {
-    background: #3b82f6; color: #fff; border: none; border-radius: 6px;
+    background: #5865F2; color: #fff; border: none; border-radius: 6px;
     padding: 8px 16px; font-size: 14px; cursor: pointer;
   }
   button:hover { opacity: .9; }
   button.sec { background: #2c3240; }
   button.danger { background: #c0392b; }
+  button.warn { background: #d97706; }
   button:disabled { opacity: .5; cursor: not-allowed; }
   button.mode { background: #2c3240; }
-  button.mode.active { background: #3b82f6; border-color: #9fd0ff; }
+  button.mode.active { background: #5865F2; border-color: #aeb6ff; }
   button.mode.active::after { content: " ✓"; }
   table { width: 100%; border-collapse: collapse; font-size: 14px; }
   th, td { text-align: left; padding: 8px 6px; border-bottom: 1px solid #363d49; }
@@ -733,6 +857,9 @@ PAGE_HTML = """<!DOCTYPE html>
   .addrow button { flex: none; }
   .hint { color: #8b93a1; font-size: 12px; margin-top: 8px; }
   .tip { color: #ffd479; font-size: 12px; }
+  .addgrid { display: grid; gap: 8px; margin-top: 10px; align-items: center; }
+  .addgrid input, .addgrid button { width: 100%; }
+  .delbtn { width: 100%; }
 </style>
 </head>
 <body>
@@ -770,41 +897,61 @@ PAGE_HTML = """<!DOCTYPE html>
 
   <div class="card">
     <h2>QQ 接收群</h2>
-    <table>
-      <thead><tr><th style="width:28px">启用</th><th>群 openid</th><th style="width:30%">备注</th><th style="width:60px"></th></tr></thead>
+    <table style="table-layout:fixed">
+      <thead><tr><th style="width:64px;text-align:center">启用</th><th>群 openid</th><th style="width:30%">备注</th><th style="width:100px"></th></tr></thead>
       <tbody id="groupBody"></tbody>
     </table>
-    <div class="row addrow">
+    <div class="addgrid" style="grid-template-columns:64px 1fr 30% 100px;">
+      <div></div>
       <input id="newOpenid" placeholder="粘贴群 openid（机器人在群里 @ 后可从日志/qq_group_openids.json 获取）">
       <input id="newRemark" placeholder="备注（可选）">
       <button id="btnAddGroup">添加</button>
     </div>
     <div class="row addrow">
       <button id="btnSync" class="sec">同步自动发现的群</button>
-      <button id="btnReset" class="sec">恢复默认配置</button>
       <button id="btnQQPlatform" class="sec">QQ 开放平台管理页</button>
+      <button id="btnReset" class="warn" style="margin-left:auto">⚠ 恢复默认配置</button>
     </div>
-    <div class="hint tip">勾选 = 该群接收 Discord 转发消息；修改后立即生效，无需重启。</div>
-  </div>
-
-  <div class="card">
-    <h2>私聊转发白名单</h2>
-    <textarea id="allowedUsers" rows="3" style="width:100%;background:#1a1f27;border:1px solid #3a4250;color:#e6e8eb;border-radius:5px;padding:8px;font-family:Consolas,monospace;font-size:12px;" placeholder="每行一个 QQ 用户 openid，留空 = 不限制"></textarea>
-    <div class="hint">只限制私聊「relay ...」命令；机器人在群里被 @ 自动发现群不受影响。修改后立即生效。</div>
+    <div class="hint">勾选 = 该群接收 Discord 转发消息；修改后立即生效，无需重启。</div>
   </div>
 
   <div class="card">
     <h2>Discord 转发频道</h2>
-    <table>
-      <thead><tr><th style="width:28px">启用</th><th>频道名称</th><th>频道 ID</th><th style="width:60px"></th></tr></thead>
+    <table style="table-layout:fixed">
+      <thead><tr><th style="width:64px;text-align:center">启用</th><th>频道名称</th><th>频道 ID</th><th style="width:100px"></th></tr></thead>
       <tbody id="chanBody"></tbody>
     </table>
-    <div class="row addrow">
-      <input id="newChanId" placeholder="频道 ID">
+    <div class="addgrid" style="grid-template-columns:64px 1fr 1fr 100px;">
+      <div></div>
       <input id="newChanName" placeholder="频道名称">
+      <input id="newChanId" placeholder="频道 ID">
       <button id="btnAddChan">添加</button>
     </div>
     <div class="hint">勾选 = 该频道的消息会被转发到已启用的 QQ 群；修改后立即生效。</div>
+  </div>
+
+  <div class="card">
+    <h2>离线补发</h2>
+    <div class="row" style="gap:20px;align-items:center;flex-wrap:wrap;">
+      <label class="row" style="gap:8px;align-items:center;cursor:pointer;">
+        <input type="checkbox" id="backfillEnabled" style="width:16px;height:16px;">
+        <span>启用补发</span>
+      </label>
+      <label class="row" style="gap:8px;align-items:center;">
+        <span>单次补发上限</span>
+        <input type="number" id="backfillLimit" min="1" step="1" style="width:90px;background:#1a1f27;border:1px solid #3a4250;color:#e6e8eb;border-radius:5px;padding:6px 8px;font-size:13px;">
+        <span>条/频道</span>
+      </label>
+      <span class="row" style="gap:8px;align-items:center;margin-left:auto;">
+        <span>待补发</span>
+        <b id="backfillPending">—</b>
+      </span>
+    </div>
+    <div class="row" style="margin-top:10px;">
+      <button id="btnBackfillRun" class="sec">立即补发</button>
+      <button id="btnBackfillClear" class="warn" style="margin-left:auto">清除待补发</button>
+    </div>
+    <div class="hint">启用补发后，机器人每次连接会补发离线期间未转发的消息（旧消息优先，逐批补发，每批不超过上限）。清除待补发会把记录推进到最新消息，未转发的旧消息将不再补发。</div>
   </div>
 
   <div class="card">
@@ -825,8 +972,11 @@ PAGE_HTML = """<!DOCTYPE html>
 <script>
 let settings = null;
 
-// QQ 开放平台「我的机器人」管理页（AppID 1905519536）
-const QQ_PLATFORM_URL = "https://q.qq.com/qqbot/dashboard/manage/1905519536";
+// QQ 开放平台「我的机器人」管理页，AppID 从 settings.qq_appid 读取（未配置时按钮隐藏）
+function qqPlatformUrl() {
+  var appid = settings && settings.qq_appid ? String(settings.qq_appid) : "";
+  return appid ? "https://q.qq.com/qqbot/dashboard/manage/" + appid : "";
+}
 
 async function jget(url) {
   const r = await fetch(url);
@@ -884,11 +1034,16 @@ var MODE_INFO = {
 
 function renderMode(mode) {
   var info = MODE_INFO[mode] || MODE_INFO.custom;
+  var hasTestIds = !!(settings && settings.test_group_openid && settings.test_channel_id);
+  ["modeTest", "modeForward"].forEach(function (id) {
+    document.getElementById(id).disabled = !hasTestIds;
+  });
   ["modeTest", "modeForward", "modeCustom"].forEach(function (id) {
     document.getElementById(id).classList.toggle("active", id === info.btn);
   });
   document.getElementById("modeHint").textContent =
-    "当前模式：" + info.name + " · " + info.hint;
+    "当前模式：" + info.name + " · " + info.hint +
+    (hasTestIds ? "" : " · 未配置测试群/频道，仅自定义模式可用");
 }
 
 function renderSettings() {
@@ -897,10 +1052,10 @@ function renderSettings() {
   settings.qq_group_openids.forEach((g, i) => {
     const tr = document.createElement("tr");
     tr.innerHTML =
-      '<td><input type="checkbox" data-kind="group" data-i="' + i + '"' + (g.enabled ? " checked" : "") + '></td>' +
+      '<td style="text-align:center"><input type="checkbox" data-kind="group" data-i="' + i + '"' + (g.enabled ? " checked" : "") + '></td>' +
       '<td class="mono">' + escapeHtml(g.openid) + '</td>' +
       '<td><input type="text" value="' + escapeHtml(g.remark || "") + '" data-kind="groupRemark" data-i="' + i + '"></td>' +
-      '<td><button class="sec" data-kind="groupDel" data-i="' + i + '">删除</button></td>';
+      '<td><button class="sec delbtn" data-kind="groupDel" data-i="' + i + '">删除</button></td>';
     gb.appendChild(tr);
   });
   const cb = document.getElementById("chanBody");
@@ -908,20 +1063,88 @@ function renderSettings() {
   settings.discord_channels.forEach((c, i) => {
     const tr = document.createElement("tr");
     tr.innerHTML =
-      '<td><input type="checkbox" data-kind="chan" data-i="' + i + '"' + (c.enabled ? " checked" : "") + '></td>' +
+      '<td style="text-align:center"><input type="checkbox" data-kind="chan" data-i="' + i + '"' + (c.enabled ? " checked" : "") + '></td>' +
       '<td>' + escapeHtml(c.name || "") + '</td>' +
       '<td class="mono">' + escapeHtml(c.id) + '</td>' +
-      '<td><button class="sec" data-kind="chanDel" data-i="' + i + '">删除</button></td>';
+      '<td><button class="sec delbtn" data-kind="chanDel" data-i="' + i + '">删除</button></td>';
     cb.appendChild(tr);
   });
-  const ta = document.getElementById("allowedUsers");
-  if (ta) ta.value = (settings.allowed_users || []).join("\\n");
+  // 离线补发设置
+  const bfEnabled = document.getElementById("backfillEnabled");
+  if (bfEnabled) bfEnabled.checked = settings.backfill_enabled !== false;
+  const bfLimit = document.getElementById("backfillLimit");
+  if (bfLimit) bfLimit.value = Number(settings.backfill_limit) > 0 ? settings.backfill_limit : 10;
+  // QQ 开放平台按钮：未配置 AppID 时隐藏
+  const qqBtn = document.getElementById("btnQQPlatform");
+  if (qqBtn) qqBtn.style.display = qqPlatformUrl() ? "" : "none";
 }
 
 function escapeHtml(s) {
   return String(s).replace(/[&<>"']/g, function (c) {
     return {"&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;"}[c];
   });
+}
+
+function renderBackfill(data) {
+  const el = document.getElementById("backfillPending");
+  if (!el) return;
+  if (!data || !data.ok) {
+    el.textContent = data && data.running === false ? "机器人未运行" : "—";
+    return;
+  }
+  const total = data.total || 0;
+  el.textContent = total > 0 ? ("共 " + total + " 条") : "无";
+  el.style.color = total > 0 ? "#e5b567" : "";
+}
+
+async function refreshBackfill() {
+  try {
+    const r = await jget("/api/backfill/pending");
+    renderBackfill(r);
+  } catch (err) {
+    renderBackfill(null);
+  }
+}
+
+async function confirmReset() {
+  let impact = "（获取默认配置失败，请确认后谨慎操作）";
+  try {
+    const def = await jget("/api/settings/default");
+    const s = settings || {qq_group_openids: [], discord_channels: []};
+    const dg = def.qq_group_openids || [];
+    const dc = def.discord_channels || [];
+    const gids = {}, cids = {};
+    dg.forEach(function (g) { gids[String(g.openid)] = true; });
+    dc.forEach(function (c) { cids[String(c.id)] = true; });
+    const gLost = (s.qq_group_openids || []).filter(function (g) { return !gids[String(g.openid)]; });
+    const cLost = (s.discord_channels || []).filter(function (c) { return !cids[String(c.id)]; });
+    const lines = [];
+    if (gLost.length) {
+      lines.push("• 将被移除的群：" + gLost.map(function (g) {
+        return (g.remark || "未命名群") + "（" + g.openid + "）";
+      }).join("、"));
+    }
+    if (cLost.length) {
+      lines.push("• 将被移除的频道：" + cLost.map(function (c) {
+        return (c.name || "未命名频道") + "（" + c.id + "）";
+      }).join("、"));
+    }
+    if (!gLost.length && !cLost.length) {
+      lines.push("• 当前群/频道列表与默认配置一致，没有需要移除的项");
+    }
+    impact = lines.join("\\n");
+  } catch (err) { /* 保留默认 impact */ }
+  const ok = confirm(
+    "⚠ 恢复默认配置（慎用）\\n" +
+    "此操作会将 data/settings.json 整体恢复为出厂默认值，不可撤销：\\n" +
+    "• QQ 接收群 / Discord 转发频道列表重置为默认配置（仅保留默认的测试群与默认频道），当前启用的其它群/频道会被移除\\n" +
+    "• 日志级别、开机自启、统计数据、机器人进程均不受影响，不会自动重启\\n" +
+    impact + "\\n\\n确定恢复默认配置？"
+  );
+  if (!ok) return;
+  const r = await jpost("/api/settings/reset");
+  settings = r.settings;
+  renderSettings();
 }
 
 async function saveAndReload() {
@@ -960,12 +1183,11 @@ document.addEventListener("click", async function (e) {
     settings = r.settings;
     renderSettings();
   } else if (btn.id === "btnReset") {
-    if (!confirm("确定恢复默认配置？当前启停设置会被覆盖。")) return;
-    const r = await jpost("/api/settings/reset");
-    settings = r.settings;
-    renderSettings();
+    await confirmReset();
   } else if (btn.id === "btnQQPlatform") {
-    window.open(QQ_PLATFORM_URL, "_blank");
+    var url = qqPlatformUrl();
+    if (url) window.open(url, "_blank");
+    else alert("未配置 QQ AppID（settings.json 的 qq_appid）");
   } else if (btn.id === "btnLogLevel") {
     const level = document.getElementById("logLevel").value;
     const r = await jpost("/api/bot/loglevel", {level: level});
@@ -975,6 +1197,15 @@ document.addEventListener("click", async function (e) {
     const r = await jpost("/api/bot/log/clear");
     if (!r.ok) alert(r.msg || "清空失败");
     await refreshStatus();
+  } else if (btn.id === "btnBackfillRun") {
+    const r = await jpost("/api/backfill/run");
+    alert(r.ok ? (r.msg || "补发已触发") : (r.msg || "补发失败"));
+    await refreshBackfill();
+  } else if (btn.id === "btnBackfillClear") {
+    if (!confirm("清除待补发？未转发的旧消息将不再补发，此操作不可撤销。")) return;
+    const r = await jpost("/api/backfill/clear");
+    alert(r.ok ? ("已清除 " + (r.cleared || 0) + " 个频道的待补发") : (r.msg || "清除失败"));
+    await refreshBackfill();
   } else if (btn.id === "btnStart") {
     await jpost("/api/bot/start");
     await sleep(800); await refreshStatus();
@@ -1003,6 +1234,19 @@ document.addEventListener("change", async function (e) {
     el.checked = !!r.enabled;
     return;
   }
+  if (el.id === "backfillEnabled") {
+    settings.backfill_enabled = el.checked;
+    await saveAndReload();
+    return;
+  }
+  if (el.id === "backfillLimit") {
+    let v = parseInt(el.value, 10);
+    if (!(v > 0)) v = 10;
+    settings.backfill_limit = v;
+    el.value = v;
+    await saveAndReload();
+    return;
+  }
   if (!el.dataset.kind) return;
   if (el.dataset.kind === "group") {
     settings.qq_group_openids[Number(el.dataset.i)].enabled = el.checked;
@@ -1017,10 +1261,6 @@ document.addEventListener("blur", async function (e) {
   const el = e.target;
   if (el.dataset.kind === "groupRemark") {
     settings.qq_group_openids[Number(el.dataset.i)].remark = el.value;
-    await saveAndReload();
-  }
-  if (el.id === "allowedUsers") {
-    settings.allowed_users = el.value.split("\\n").map(function (s) { return s.trim(); }).filter(Boolean);
     await saveAndReload();
   }
 }, true);
@@ -1043,6 +1283,8 @@ async function init() {
   } catch (err) { /* ignore */ }
   await refreshStatus();
   setInterval(refreshStatus, 3000);
+  await refreshBackfill();
+  setInterval(refreshBackfill, 30000);
 }
 
 init();

@@ -1,15 +1,12 @@
 import os
 
-# Discord频道列表（默认值；实际启用的频道以 data/settings.json 为准）
+# Discord频道列表（可分发版本：不内置默认频道；
+# 首次运行时自动生成空配置，由用户在管理面板添加）
 
-DISCORD_CHANNELS = {
-    "1525802021582540822": "测试频道消息",
-    "1428025029290889318": "MLD新闻",
-    "222730696786051073": "snekflat新闻",
-}
+DISCORD_CHANNELS = {}
 
 
-# QQ 接收群（默认值；实际启用的群以 data/settings.json 为准）
+# QQ 接收群（默认空；实际启用的群以 data/settings.json 为准）
 #
 # 官方机器人使用 group_openid，不是群号。
 # group_openid 无法从群号推算，需要机器人入群后获取：
@@ -18,9 +15,7 @@ DISCORD_CHANNELS = {
 #    或读取 data/qq_group_openids.json
 # 3. 在管理面板中启用该 openid
 #
-QQ_GROUP_OPENIDS = [
-    "C206FC38640F9A3CCE072C9797FAED43",
-]
+QQ_GROUP_OPENIDS = []
 
 
 # =====================================================
@@ -84,7 +79,8 @@ def _default_settings():
     return {
         "qq_group_openids": groups,
         "discord_channels": channels,
-        "allowed_users": [],
+        "backfill_enabled": True,
+        "backfill_limit": 10,
     }
 
 
@@ -192,17 +188,20 @@ def get_active_groups():
     return list(QQ_GROUP_OPENIDS)
 
 
-def get_allowed_users():
-    """返回私聊转发白名单（QQ 用户 openid 列表）
-
-    空列表 = 不限制任何用户使用私聊 relay 命令。
-    非空时只有列表内的用户能私聊机器人转发 Discord 链接/文字。"""
+def get_backfill_limit():
+    """每次启动补发时，每个频道最多补发的消息条数（默认 10）"""
     data = _load_settings()
-    items = data.get("allowed_users")
-    if isinstance(items, list):
-        return [
-            str(x).strip()
-            for x in items
-            if str(x).strip()
-        ]
-    return []
+    try:
+        value = int(data.get("backfill_limit") or 10)
+    except (TypeError, ValueError):
+        return 10
+    return value if value > 0 else 10
+
+
+def get_backfill_enabled():
+    """补发功能总开关（默认开启）"""
+    data = _load_settings()
+    value = data.get("backfill_enabled")
+    if value is None:
+        return True
+    return bool(value)
