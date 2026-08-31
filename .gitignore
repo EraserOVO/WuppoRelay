@@ -7,3 +7,5 @@ backup/
 .env.prod
 .zcode/
 *.egg-info/
+/data/
+*.lnk
