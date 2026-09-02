@@ -11,7 +11,9 @@ from plugins.config import (
     get_active_groups,
     get_backfill_limit,
     get_backfill_enabled,
+    get_channel_filter,
 )
+from plugins.filter import check_message_filter
 from plugins.history import (
     load_last_messages,
     save_last_messages,
@@ -23,6 +25,13 @@ from plugins.fetch import (
 )
 from plugins.sender import send_relay_message
 from plugins.stats import record
+from plugins.dedup import (
+    normalize_channel_map,
+    select_target_groups,
+    compute_base_id,
+    apply_baseline,
+    apply_success,
+)
 
 
 # =====================================================
@@ -112,33 +121,22 @@ async def _backfill_channel(channel_id, channel_name, active_groups, limit):
 
     last_messages = load_last_messages()
 
-    channel_map = last_messages.get(
-        channel_id
+    channel_map = normalize_channel_map(
+        last_messages,
+        channel_id,
     )
 
-    if not isinstance(channel_map, dict):
-        # 旧格式 {channel: id_str} 迁移为 {channel: {"*": id_str}}
-        channel_map = {"*": channel_map} if channel_map else {}
-        last_messages[channel_id] = channel_map
-
-    # 各群有效记录（群专属优先，缺失回退 "*" 兜底），
-    # 不再直接取 channel_map 所有 value 的最小值，
-    # 避免古老的 "*" 兜底记录把补发起点拖得过旧
-    effective_ids = []
-
-    for group in active_groups:
-
-        last_id = (
-            channel_map.get(group)
-            or channel_map.get("*")
-        )
-
-        if last_id:
-            effective_ids.append(last_id)
+    # 各群有效 last_id 的最小值（群专属优先，缺失回退 "*" 兜底），
+    # 避免古老的 "*" 兜底记录把补发起点拖得过旧；
+    # 全无有效记录时返回 None（首次启用场景）
+    base_id = compute_base_id(
+        channel_map,
+        active_groups,
+    )
 
     # 无任何群的有效记录（首次启用）：只建基线（记录最新消息 ID），
     # 不补发历史，防止刷屏
-    if not effective_ids:
+    if base_id is None:
 
         latest = await fetch_channel_latest(
             channel_id
@@ -146,8 +144,11 @@ async def _backfill_channel(channel_id, channel_name, active_groups, limit):
 
         if latest:
 
-            for group in active_groups:
-                channel_map[group] = latest
+            apply_baseline(
+                channel_map,
+                active_groups,
+                latest,
+            )
 
             save_last_messages(
                 last_messages
@@ -160,12 +161,6 @@ async def _backfill_channel(channel_id, channel_name, active_groups, limit):
             )
 
         return
-
-    # 以最落后的群记录为起点，确保每个群的缺口都不漏
-    base_id = min(
-        effective_ids,
-        key=int
-    )
 
     messages = await fetch_channel_messages_after(
         channel_id,
@@ -194,31 +189,45 @@ async def _backfill_channel(channel_id, channel_name, active_groups, limit):
         # 逐条前重读最新记录，实时转发已处理的群自动跳过
         last_messages = load_last_messages()
 
-        channel_map = last_messages.get(
-            channel_id
+        channel_map = normalize_channel_map(
+            last_messages,
+            channel_id,
         )
 
-        if not isinstance(channel_map, dict):
-            channel_map = {"*": channel_map} if channel_map else {}
-            last_messages[channel_id] = channel_map
-
-        target_groups = []
-
-        for group in active_groups:
-
-            last_id = channel_map.get(
-                group
-            ) or channel_map.get(
-                "*"
-            )
-
-            if (
-                last_id is None
-                or int(message_id) > int(last_id)
-            ):
-                target_groups.append(group)
+        target_groups = select_target_groups(
+            channel_map,
+            active_groups,
+            message_id,
+        )
 
         if not target_groups:
+            continue
+
+        # 频道消息筛选：被过滤的消息仍更新去重记录，
+        # 避免下次补发反复重处理同一条消息
+        msg_author_username = msg.get("author_username") or ""
+        filter_config = get_channel_filter(channel_id)
+
+        if not check_message_filter(
+            filter_config,
+            msg_author_username,
+            msg.get("content") or "",
+            msg.get("embeds"),
+        ):
+            logger.debug(
+                "启动补发: 消息被筛选跳过: {} {} (author={})",
+                channel_id,
+                message_id,
+                msg_author_username,
+            )
+
+            apply_success(
+                channel_map,
+                {g: True for g in target_groups},
+                message_id,
+            )
+            save_last_messages(last_messages)
+
             continue
 
         msg["channel_name"] = channel_name
@@ -253,15 +262,11 @@ async def _backfill_channel(channel_id, channel_name, active_groups, limit):
 
         # 只给发送成功的群记录去重 ID（失败的群保留旧记录，
         # 下次连接补发时只会补失败的群）
-        changed = False
-
-        for group, ok in ok_map.items():
-
-            if ok:
-                channel_map[group] = message_id
-                changed = True
-
-        if changed:
+        if apply_success(
+            channel_map,
+            ok_map,
+            message_id,
+        ):
 
             save_last_messages(
                 last_messages

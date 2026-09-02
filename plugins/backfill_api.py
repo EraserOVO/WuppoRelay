@@ -20,6 +20,11 @@ from plugins.fetch import (
     _resolve_channel_name,
 )
 from plugins.backfill import _backfill_missed
+from plugins.dedup import (
+    normalize_channel_map,
+    compute_base_id,
+    apply_baseline,
+)
 
 
 # =====================================================
@@ -58,32 +63,19 @@ async def api_backfill_pending():
 
     for channel_id, channel_name in channels.items():
 
-        channel_map = last_messages.get(channel_id)
+        channel_map = normalize_channel_map(
+            last_messages,
+            channel_id,
+        )
 
-        if not isinstance(channel_map, dict):
-            channel_map = {"*": channel_map} if channel_map else {}
-            last_messages[channel_id] = channel_map
+        base_id = compute_base_id(
+            channel_map,
+            active_groups,
+        )
 
-        effective_ids = []
-
-        for group in active_groups:
-
-            last_id = (
-                channel_map.get(group)
-                or channel_map.get("*")
-            )
-
-            if last_id:
-                effective_ids.append(last_id)
-
-        if not effective_ids:
+        if base_id is None:
             result[channel_id] = {"name": channel_name, "count": 0}
             continue
-
-        base_id = min(
-            effective_ids,
-            key=int
-        )
 
         try:
 
@@ -152,11 +144,10 @@ async def api_backfill_clear():
 
     for channel_id in channels:
 
-        channel_map = last_messages.get(channel_id)
-
-        if not isinstance(channel_map, dict):
-            channel_map = {"*": channel_map} if channel_map else {}
-            last_messages[channel_id] = channel_map
+        channel_map = normalize_channel_map(
+            last_messages,
+            channel_id,
+        )
 
         latest = await fetch_channel_latest(
             channel_id
@@ -165,18 +156,12 @@ async def api_backfill_clear():
         if not latest:
             continue
 
-        changed = False
-
-        for group in active_groups:
-            if channel_map.get(group) != latest:
-                channel_map[group] = latest
-                changed = True
-
-        if channel_map.get("*") != latest:
-            channel_map["*"] = latest
-            changed = True
-
-        if changed:
+        if apply_baseline(
+            channel_map,
+            active_groups,
+            latest,
+            include_star=True,
+        ):
             cleared += 1
 
     if cleared:

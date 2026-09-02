@@ -1,3 +1,4 @@
+import asyncio
 import os
 import re
 
@@ -34,6 +35,33 @@ from plugins.media import (
 # =====================================================
 
 DISCORD_API_TIMEOUT = 20
+
+# =====================================================
+# 补发抓取分页参数（仅 fetch_channel_messages_after 使用）
+#
+# - FETCH_PAGE_INTERVAL：翻页请求间隔秒数，避免大缺口连续请求过快触发限流
+# - FETCH_COLLECT_CAP：单次收集消息总量上限，防止极大缺口无限占用内存；
+#   未确认翻到缺口底部就超限时返回 []（本轮不补发），绝不返回不完整
+#   列表让补发游标越过更旧的缺口消息
+# - RATE_LIMIT_ATTEMPTS / RATE_LIMIT_FALLBACK：429 重试次数与
+#   Retry-After 缺失/非法时的默认退避秒数
+# =====================================================
+
+FETCH_PAGE_INTERVAL = 0.5
+FETCH_COLLECT_CAP = 1000
+RATE_LIMIT_ATTEMPTS = 3
+RATE_LIMIT_FALLBACK = 5.0
+
+
+def _rate_limit_wait(response, fallback):
+    """从 429 响应头取 Retry-After（秒）；缺失/非法时用 fallback"""
+    try:
+        raw = response.headers.get("retry-after")
+        if raw:
+            return max(float(raw), fallback)
+    except Exception:
+        pass
+    return fallback
 
 
 def parse_discord_url(url):
@@ -114,6 +142,7 @@ def normalize_api_message(msg):
 
     return {
         "message_id": str(msg.get("id") or ""),
+        "author_username": author.get("username") or "",
         "username": username,
         "channel_id": str(msg.get("channel_id") or ""),
         "channel_name": None,
@@ -187,7 +216,14 @@ async def fetch_channel_messages_after(channel_id, after_id, limit=10):
 
     Discord API 单页上限 100 条且按 id 倒序返回，因此翻页到底收集全部
     缺口后取最旧 limit 条，保证补发从旧消息开始、不丢旧消息。
-    失败返回 []"""
+
+    防漏发安全规则（补发游标只按已发送消息推进，返回不完整列表会让
+    游标越过更旧的缺口消息造成永久漏发，因此）：
+    - 任一页请求异常/超时/非 200/429 重试耗尽/响应解析失败/翻页锚点缺失
+      → 丢弃已收集的部分结果，返回 []，宁可下一轮重新补发
+    - 收集量超过 FETCH_COLLECT_CAP 且未确认翻到缺口底部 → 返回 []，
+      本轮不补发（极大缺口如确认放弃，可在面板"清除待补发"）
+    - 仅当确认翻到缺口底部（短页/空页）才返回收集结果"""
     if limit <= 0:
         return []
 
@@ -212,31 +248,77 @@ async def fetch_channel_messages_after(channel_id, after_id, limit=10):
         if before:
             api += f"&before={before}"
 
-        try:
-            async with httpx.AsyncClient(
-                proxy=_get_proxy(),
-                timeout=DISCORD_API_TIMEOUT,
-            ) as client:
-                response = await client.get(
-                    api,
-                    headers=headers,
+        # 单页请求：429 按 Retry-After 退避重试；其余失败直接放弃本轮
+        response = None
+        rate_limited = False
+
+        for attempt in range(1, RATE_LIMIT_ATTEMPTS + 1):
+
+            try:
+                async with httpx.AsyncClient(
+                    proxy=_get_proxy(),
+                    timeout=DISCORD_API_TIMEOUT,
+                ) as client:
+                    response = await client.get(
+                        api,
+                        headers=headers,
+                    )
+            except Exception as exc:
+                logger.warning(
+                    "Discord API请求异常，本轮补发放弃: {}",
+                    exc
                 )
-        except Exception as exc:
-            logger.warning(
-                "Discord API请求异常: {}",
-                exc
+                return []
+
+            if response.status_code != 429:
+                break
+
+            rate_limited = True
+
+            if attempt == RATE_LIMIT_ATTEMPTS:
+                break
+
+            wait = _rate_limit_wait(
+                response,
+                RATE_LIMIT_FALLBACK,
             )
-            break
+
+            logger.warning(
+                "Discord API限流(429)，{}s 后重试({}/{}): {}",
+                wait,
+                attempt,
+                RATE_LIMIT_ATTEMPTS - 1,
+                channel_id,
+            )
+
+            await asyncio.sleep(wait)
 
         if response.status_code != 200:
-            logger.warning(
-                "Discord API错误: {} {}",
-                response.status_code,
-                response.text
-            )
-            break
 
-        data = response.json()
+            if rate_limited:
+                logger.warning(
+                    "Discord API限流重试耗尽，本轮补发放弃: {}",
+                    channel_id
+                )
+            else:
+                logger.warning(
+                    "Discord API错误: {} {}",
+                    response.status_code,
+                    response.text
+                )
+
+            # 丢弃部分结果：返回不完整列表会让补发游标越过
+            # 更旧的缺口消息（永久漏发），宁可下一轮重新补发
+            return []
+
+        try:
+            data = response.json()
+        except Exception as exc:
+            logger.warning(
+                "Discord API响应解析失败，本轮补发放弃: {}",
+                exc
+            )
+            return []
 
         if not isinstance(data, list) or not data:
             break
@@ -244,13 +326,33 @@ async def fetch_channel_messages_after(channel_id, after_id, limit=10):
         collected.extend(data)
 
         if len(data) < page_limit:
+            # 短页 = 已翻到缺口底部，收集完整
             break
+
+        if len(collected) > FETCH_COLLECT_CAP:
+            # 缺口超出收集上限且底部未确认：无法保证不含更旧消息，
+            # 本轮安全结束不补发，避免游标越过未抓取的旧消息
+            logger.warning(
+                "补发抓取: 频道{}缺口超过收集上限({}条)，本轮不补发"
+                "（如确认放弃缺口可在面板清除待补发）",
+                channel_id,
+                FETCH_COLLECT_CAP,
+            )
+            return []
 
         # 本页取满，翻页取更早的（仍晚于 after_id）消息
         before = str(data[-1].get("id") or "")
 
         if not before:
-            break
+            # 整页却拿不到翻页锚点，同样无法确认缺口底部，按失败处理
+            logger.warning(
+                "补发抓取: 翻页锚点缺失，本轮补发放弃: {}",
+                channel_id
+            )
+            return []
+
+        # 页间小延迟：大缺口连续请求过快容易触发 429
+        await asyncio.sleep(FETCH_PAGE_INTERVAL)
 
     if not collected:
         return []

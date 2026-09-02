@@ -8,7 +8,9 @@ from nonebot.adapters.discord.event import GuildMessageCreateEvent
 from plugins.config import (
     get_active_channels,
     get_active_groups,
+    get_channel_filter,
 )
+from plugins.filter import check_message_filter
 from plugins.history import (
     load_last_messages,
     save_last_messages,
@@ -19,6 +21,11 @@ from plugins.fetch import (
 )
 from plugins.sender import send_relay_message
 from plugins.stats import record
+from plugins.dedup import (
+    normalize_channel_map,
+    select_target_groups,
+    apply_success,
+)
 
 
 relay = on_message(
@@ -73,35 +80,18 @@ async def handle(
 
     last_messages = load_last_messages()
 
-
-    channel_map = last_messages.get(
-        channel_id
+    channel_map = normalize_channel_map(
+        last_messages,
+        channel_id,
     )
-
-    if not isinstance(channel_map, dict):
-        # 旧格式 {channel: id_str} 迁移为 {channel: {"*": id_str}}，
-        # "*" 表示对所有群生效的兜底记录
-        channel_map = {"*": channel_map} if channel_map else {}
-        last_messages[channel_id] = channel_map
-
 
     # 按群分别判断是否跳过（A4：某个群发送失败不会拖累其他群的去重，
     # 重连补发时已成功的群跳过、失败的群重试）
-    target_groups = []
-
-    for group in active_groups:
-
-        last_id = channel_map.get(
-            group
-        ) or channel_map.get(
-            "*"
-        )
-
-        if (
-            last_id is None
-            or int(message_id) > int(last_id)
-        ):
-            target_groups.append(group)
+    target_groups = select_target_groups(
+        channel_map,
+        active_groups,
+        message_id,
+    )
 
 
     if not target_groups:
@@ -113,6 +103,32 @@ async def handle(
 
         return
 
+    # 频道消息筛选：被过滤的消息仍更新去重记录，
+    # 避免补发时反复重处理同一条消息
+    author_username = getattr(event.author, "username", "") if getattr(event, "author", None) else ""
+    filter_config = get_channel_filter(channel_id)
+
+    if not check_message_filter(
+        filter_config,
+        author_username,
+        getattr(event, "content", "") or "",
+        getattr(event, "embeds", None),
+    ):
+        logger.debug(
+            "消息被筛选跳过: {} {} (author={})",
+            channel_id,
+            message_id,
+            author_username,
+        )
+
+        apply_success(
+            channel_map,
+            {g: True for g in target_groups},
+            message_id,
+        )
+        save_last_messages(last_messages)
+
+        return
 
     message = normalize_event(
         event,
@@ -149,16 +165,11 @@ async def handle(
 
     # 只给发送成功的群记录去重 ID（失败的群保留旧记录，
     # 重连补发时只补失败的群，已成功的群不会收到重复消息）
-    changed = False
-
-    for group, ok in ok_map.items():
-
-        if ok:
-            channel_map[group] = message_id
-            changed = True
-
-
-    if changed:
+    if apply_success(
+        channel_map,
+        ok_map,
+        message_id,
+    ):
 
         save_last_messages(
             last_messages
