@@ -1,0 +1,203 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>WuppoRelay 管理面板</title>
+<link rel="stylesheet" href="/style.css">
+</head>
+<body>
+  <div style="display:flex;justify-content:space-between;align-items:center;">
+    <h1>WuppoRelay 管理面板</h1>
+    <button id="btnRestartPanel" class="iconbtn" title="重启面板">⟳</button>
+  </div>
+  <div class="sub">Discord → QQ 实时转发 · 本地管理（127.0.0.1:8090）</div>
+
+  <div class="cardrow">
+    <div class="card">
+      <h2>机器人状态</h2>
+      <div class="row">
+        <span id="badge" class="badge off">检测中…</span>
+        <span id="pidinfo" class="pid"></span>
+        <span id="stats" class="pid"></span>
+      </div>
+      <div class="row" style="margin-top:10px;">
+        <button id="btnStart">启动机器人</button>
+        <button id="btnStop" class="danger">停止机器人</button>
+        <button id="btnRestart" class="sec">重启机器人</button>
+      </div>
+      <div class="hint" id="managedHint"></div>
+    </div>
+
+    <div class="card">
+      <h2>模式选择</h2>
+      <div class="row">
+        <button id="modeForward" class="mode">转发模式</button>
+        <button id="modeTest" class="mode">测试模式</button>
+        <button id="modeCustom" class="mode">自定义模式</button>
+      </div>
+      <div class="hint" id="modeHint"></div>
+    </div>
+  </div>
+
+  <div class="card">
+    <h2 style="display:flex;justify-content:space-between;align-items:center;">QQ 接收群 <button class="foldbtn" data-fold="groupContent">▾</button></h2>
+    <div id="groupContent">
+      <table style="table-layout:fixed">
+        <thead><tr><th style="width:64px;text-align:center">启用<br><input type="checkbox" id="groupAllEnabled"></th><th style="width:64px;text-align:center">测试<br><input type="checkbox" id="groupAllTest"></th><th>名称</th><th style="width:18%">账号</th><th style="width:30%">Group OpenID</th><th style="width:64px"></th></tr></thead>
+        <tbody id="groupBody"></tbody>
+      </table>
+      <div class="row addrow">
+        <button id="btnAddGroup">＋ 新增</button>
+        <button id="btnSync" class="sec">注册审核</button>
+        <button id="btnQQPlatform" class="sec">QQ 开放平台管理页</button>
+      </div>
+      <div class="hint">勾选 = 该群接收 Discord 转发消息；修改后立即生效，无需重启。群成员在群里发送"注册群 群号 群名称"申请接入（须为白名单用户），点"注册审核"处理。</div>
+    </div>
+  </div>
+
+  <div class="card">
+    <h2 style="display:flex;justify-content:space-between;align-items:center;">Discord 转发频道 <button class="foldbtn" data-fold="chanContent">▾</button></h2>
+    <div id="chanContent">
+      <table style="table-layout:fixed">
+        <thead><tr><th style="width:64px;text-align:center">启用<br><input type="checkbox" id="chanAllEnabled"></th><th style="width:64px;text-align:center">测试<br><input type="checkbox" id="chanAllTest"></th><th>频道名称</th><th style="width:26%">频道 ID</th><th style="width:76px"></th></tr></thead>
+        <tbody id="chanBody"></tbody>
+      </table>
+      <div class="row addrow">
+        <button id="btnAddChan">＋ 新增</button>
+        <button id="btnSyncChannels" class="sec">同步可读频道</button>
+        <button id="btnDiscordDev" class="sec">Discord开发者门户</button>
+      </div>
+      <div class="hint">勾选 = 该频道消息会转发到已启用的 QQ 群，立即生效。点"同步可读频道"可自动加入 Bot 有读取权限的频道（默认不启用）。</div>
+    </div>
+  </div>
+
+  <div class="card">
+    <h2 style="display:flex;justify-content:space-between;align-items:center;">私聊权限 <button class="foldbtn" data-fold="userContent">▾</button></h2>
+    <div id="userContent">
+      <table style="table-layout:fixed">
+        <thead><tr><th style="width:64px;text-align:center">启用<br><input type="checkbox" id="userAllEnabled"></th><th>名称</th><th style="width:18%">账号</th><th style="width:30%">User OpenID</th><th style="width:64px"></th></tr></thead>
+        <tbody id="userBody"></tbody>
+      </table>
+      <div class="row addrow">
+        <button id="btnAddUser">＋ 新增</button>
+        <button id="btnSyncUsers" class="sec">注册审核</button>
+      </div>
+      <div class="hint">仅勾选的用户可私聊使用 relay 命令；用户私聊发送"注册 QQ号 昵称"提交申请，点"注册审核"处理。通过后默认未启用，需手动勾选放行。</div>
+    </div>
+  </div>
+
+  <div class="cardrow">
+  <div class="card">
+    <h2>离线补发</h2>
+    <div id="backfillContent">
+      <div class="row" style="gap:20px;align-items:center;flex-wrap:wrap;">
+        <label class="row" style="gap:8px;align-items:center;cursor:pointer;">
+          <input type="checkbox" id="backfillEnabled" style="width:16px;height:16px;">
+          <span>启用补发</span>
+        </label>
+        <label class="row" style="gap:8px;align-items:center;">
+          <span>单次补发上限</span>
+          <input type="number" id="backfillLimit" min="1" step="1" style="width:90px;background:#1a1f27;border:1px solid #3a4250;color:#e6e8eb;border-radius:5px;padding:6px 8px;font-size:13px;">
+          <span>条/频道</span>
+        </label>
+        <span class="row" style="gap:8px;align-items:center;margin-left:auto;">
+          <span>待补发</span>
+          <b id="backfillPending">—</b>
+        </span>
+      </div>
+      <div class="row" style="margin-top:10px;">
+        <button id="btnBackfillRun" class="sec">立即补发</button>
+        <button id="btnBackfillRefresh" class="sec">刷新状态</button>
+        <button id="btnBackfillClear" class="warn" style="margin-left:auto">清除待补发</button>
+      </div>
+      <div class="hint">启用后，机器人每次连接自动补发离线期间未转发的消息；清除待补发后不再补发旧消息。</div>
+    </div>
+  </div>
+
+  <div class="card">
+    <h2>开机自启</h2>
+    <div id="autostartContent">
+      <div class="row" style="margin-top:10px;">
+        <label style="display:flex; align-items:center; gap:8px; font-size:13px; cursor:pointer;">
+          <input type="checkbox" id="chkAutostart" style="width:16px;height:16px;">
+          开机自动启动机器人（后台运行，不打开面板）
+        </label>
+      </div>
+      <div class="hint">启用后，Windows 开机时机器人在后台自动运行，不打开面板窗口。</div>
+    </div>
+  </div>
+  </div>
+
+  <div class="card">
+    <h2 style="display:flex;justify-content:space-between;align-items:center;">运行日志 <button class="foldbtn" data-fold="logContent">▾</button></h2>
+    <div id="logContent">
+      <pre id="log" class="log">加载中…</pre>
+      <div class="row" style="margin-top:10px;">
+        <select id="logLevel" style="background:#1a1f27;border:1px solid #3a4250;color:#e6e8eb;border-radius:5px;padding:6px 8px;font-size:13px;">
+          <option value="DEBUG">DEBUG</option>
+          <option value="INFO">INFO</option>
+          <option value="WARNING">WARNING</option>
+          <option value="ERROR">ERROR</option>
+        </select>
+        <button id="btnLogLevel" class="sec">应用日志级别</button>
+        <button id="btnClearLog" class="sec">清空日志</button>
+      </div>
+    </div>
+  </div>
+
+<div id="confirmModal" style="display:none;position:fixed;inset:0;background:rgba(0,0,0,.55);z-index:999;align-items:center;justify-content:center;">
+  <div style="background:#1e2330;border:1px solid #3a4150;border-radius:10px;padding:18px;max-width:480px;width:90%;max-height:70vh;display:flex;flex-direction:column;">
+    <h3 id="confirmTitle" style="margin:0 0 10px;"></h3>
+    <div id="confirmBody" style="overflow:auto;flex:1;margin:0 0 12px;line-height:1.8;"></div>
+    <div style="display:flex;gap:10px;justify-content:flex-end;">
+      <button id="confirmOk">确认添加</button>
+      <button id="confirmCancel" class="sec">取消</button>
+    </div>
+  </div>
+</div>
+<div id="filterModal" style="display:none;position:fixed;inset:0;background:rgba(0,0,0,.55);z-index:999;align-items:center;justify-content:center;">
+  <div style="background:#1e2330;border:1px solid #3a4150;border-radius:10px;padding:18px;max-width:480px;width:90%;display:flex;flex-direction:column;">
+    <h3 style="margin:0 0 10px;">消息筛选 <span id="filterChanName" style="font-size:13px;color:#8b93a1;font-weight:normal;"></span></h3>
+    <div style="display:flex;flex-direction:column;gap:10px;">
+      <label style="display:flex;flex-direction:column;gap:4px;">
+        <span style="font-size:13px;color:#8b93a1;">用户名筛选（不区分大小写，逗号分隔，留空不限制）</span>
+        <input type="text" id="filterUsernames" placeholder="Discord 用户名，逗号分隔">
+      </label>
+      <label style="display:flex;flex-direction:column;gap:4px;">
+        <span style="font-size:13px;color:#8b93a1;">关键词筛选（不区分大小写，逗号分隔，留空不限制）</span>
+        <input type="text" id="filterKeywords" placeholder="关键词，逗号分隔">
+      </label>
+    </div>
+    <div style="display:flex;gap:10px;justify-content:flex-end;margin-top:14px;">
+      <button id="filterSave">保存</button>
+      <button id="filterCancel" class="sec">取消</button>
+    </div>
+  </div>
+</div>
+<div id="addModal" style="display:none;position:fixed;inset:0;background:rgba(0,0,0,.55);z-index:999;align-items:center;justify-content:center;">
+  <div style="background:#1e2330;border:1px solid #3a4150;border-radius:10px;padding:18px;max-width:480px;width:90%;display:flex;flex-direction:column;">
+    <h3 id="addModalTitle" style="margin:0 0 10px;"></h3>
+    <div style="display:flex;flex-direction:column;gap:10px;">
+      <label id="addFieldNameWrap" style="display:flex;flex-direction:column;gap:4px;">
+        <span id="addFieldNameLabel" style="font-size:13px;color:#8b93a1;"></span>
+        <input type="text" id="addFieldName" placeholder="频道名称">
+      </label>
+      <label id="addFieldRemarkWrap" style="display:flex;flex-direction:column;gap:4px;">
+        <span style="font-size:13px;color:#8b93a1;">备注（可选）</span>
+        <input type="text" id="addFieldRemark" placeholder="备注">
+      </label>
+      <label style="display:flex;flex-direction:column;gap:4px;">
+        <span id="addFieldIdLabel" style="font-size:13px;color:#8b93a1;"></span>
+        <input type="text" id="addFieldId" placeholder="">
+      </label>
+    </div>
+    <div style="display:flex;gap:10px;justify-content:flex-end;margin-top:14px;">
+      <button id="addSave">添加</button>
+      <button id="addCancel" class="sec">取消</button>
+    </div>
+  </div>
+</div>
+<script src="/app.js"></script>
+</body>
+</html>

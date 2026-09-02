@@ -15,6 +15,7 @@ WuppoRelay 管理面板（无窗口运行，pythonw 启动）
 import os
 import sys
 import json
+import shutil
 import time
 import ctypes
 import socket
@@ -30,6 +31,7 @@ os.chdir(PROJECT_ROOT)
 DATA_DIR = os.path.join(PROJECT_ROOT, "data")
 LOG_DIR = os.path.join(DATA_DIR, "logs")
 SETTINGS_FILE = os.path.join(DATA_DIR, "settings.json")
+SETTINGS_BAK = SETTINGS_FILE + ".bak"
 BOT_LOG = os.path.join(LOG_DIR, "bot.log")
 PANEL_LOG = os.path.join(LOG_DIR, "panel.log")
 PID_FILE = os.path.join(DATA_DIR, "bot.pid")
@@ -69,6 +71,9 @@ except Exception:
     pass
 
 sys.path.insert(0, PROJECT_ROOT)
+
+# 面板与 bot 共用的 JSON 原子写（唯一 tmp + os.replace 重试）
+from plugins.json_io import atomic_write_json
 
 
 def _log(msg):
@@ -144,12 +149,39 @@ def get_default_settings():
     }
 
 
+def _validate_settings(data):
+    """保存前最小结构校验，返回错误信息；None 表示通过。
+
+    非法结构一律拒绝落盘：坏结构进入 settings.json 后会被 bot 判为
+    损坏配置（旧版 bot 会直接用默认值覆盖真实配置）。只校验关键
+    结构，不做字段级强校验，避免误伤前端合法负载。"""
+    if not isinstance(data, dict):
+        return "配置必须是 JSON 对象"
+    for key in ("qq_group_openids", "qq_user_openids", "discord_channels"):
+        items = data.get(key)
+        if not isinstance(items, list):
+            return "%s 必须是列表" % key
+        for item in items:
+            if not isinstance(item, dict):
+                return "%s 的每一项必须是对象" % key
+    if "backfill_enabled" in data and not isinstance(data["backfill_enabled"], bool):
+        return "backfill_enabled 必须是布尔值"
+    if "backfill_limit" in data:
+        limit = data["backfill_limit"]
+        if not isinstance(limit, int) or isinstance(limit, bool) or limit <= 0:
+            return "backfill_limit 必须是正整数"
+    return None
+
+
 def save_settings(data):
-    os.makedirs(DATA_DIR, exist_ok=True)
-    tmp = SETTINGS_FILE + ".tmp"
-    with open(tmp, "w", encoding="utf-8") as f:
-        json.dump(data, f, ensure_ascii=False, indent=2)
-    os.replace(tmp, SETTINGS_FILE)
+    # 备份上一版配置（任何误写/损坏都可从 settings.json.bak 恢复），
+    # 再走统一原子写（唯一 tmp + os.replace，见 plugins/json_io.py）
+    try:
+        if os.path.exists(SETTINGS_FILE):
+            shutil.copyfile(SETTINGS_FILE, SETTINGS_BAK)
+    except Exception as exc:
+        _log("备份 settings.json.bak 失败: %s" % exc)
+    atomic_write_json(SETTINGS_FILE, data, indent=2)
 
 
 def get_qq_appid():
@@ -645,7 +677,8 @@ def bot_api_post(path, timeout=30.0):
 
 # ---------------- FastAPI 面板 ----------------
 from fastapi import FastAPI, Request
-from fastapi.responses import HTMLResponse, JSONResponse
+from fastapi.responses import JSONResponse
+from fastapi.staticfiles import StaticFiles
 import uvicorn
 
 app = FastAPI()
@@ -671,11 +704,6 @@ async def origin_guard(request: Request, call_next):
     return response
 
 
-@app.get("/", response_class=HTMLResponse)
-def index():
-    return PAGE_HTML
-
-
 @app.get("/api/status")
 def api_status():
     st = bot_status()
@@ -683,16 +711,21 @@ def api_status():
     if st["running"]:
         # bot 进程活着不代表网关连上；询问 bot 自身连接状态
         health = bot_api_get("/api/health", timeout=2.0)
+    settings = load_settings()
     return {
         "running": st["running"],
         "pid": st["pid"],
         "managed": st["managed"],
         "health": health,
-        "mode": effective_mode(load_settings()),
+        "mode": effective_mode(settings),
         "autostart": get_autostart(),
         "log": log_tail(BOT_LOG),
         "stats": read_stats(),
         "level": current_log_level(),
+        # 补发相关：前端轮询发现 backfill_seq 变化时立即刷新待补发数量
+        "backfill_seq": _backfill_seq,
+        "backfill_enabled": settings.get("backfill_enabled", True),
+        "backfill_limit": settings.get("backfill_limit", 10),
     }
 
 
@@ -712,8 +745,49 @@ async def api_settings_save(request: Request):
         data = await request.json()
     except Exception:
         return JSONResponse({"ok": False, "msg": "数据格式错误"}, status_code=400)
+    err = _validate_settings(data)
+    if err:
+        # 校验失败绝不落盘，磁盘上的现有配置原样保留
+        return JSONResponse(
+            {"ok": False, "msg": "配置校验失败: " + err}, status_code=400
+        )
     save_settings(data)
     return {"ok": True, "settings": load_settings()}
+
+
+@app.post("/api/settings/backfill-toggle")
+async def api_settings_backfill_toggle(request: Request):
+    """补发开关字段级更新（QQ 私聊 backfill on/off 专用）
+
+    只接收 {"backfill_enabled": bool}，服务端读取当前配置后仅修改
+    这一个字段再走统一保存流程（结构校验 + .bak + 原子替换），
+    避免调用方回传整份配置覆盖面板刚保存的其他字段。
+    请求值与当前值相同时不写盘，返回 changed=false。"""
+    try:
+        body = await request.json()
+    except Exception:
+        return JSONResponse({"ok": False, "msg": "数据格式错误"}, status_code=400)
+    enabled = body.get("backfill_enabled") if isinstance(body, dict) else None
+    if not isinstance(enabled, bool):
+        return JSONResponse(
+            {"ok": False, "msg": "backfill_enabled 必须是布尔值"}, status_code=400
+        )
+    data = load_settings()
+    if data.get("backfill_enabled") == enabled:
+        return {
+            "ok": True,
+            "changed": False,
+            "backfill_enabled": enabled,
+        }
+    data["backfill_enabled"] = enabled
+    err = _validate_settings(data)
+    if err:
+        # 合并结果意外非法（如磁盘现有配置结构已坏）：拒绝落盘
+        return JSONResponse(
+            {"ok": False, "msg": "配置校验失败: " + err}, status_code=400
+        )
+    save_settings(data)
+    return {"ok": True, "changed": True, "backfill_enabled": enabled}
 
 
 @app.post("/api/settings/sync")
@@ -758,6 +832,188 @@ def api_settings_sync_preview():
         if o and o not in known_users
     ]
     return {"ok": True, "groups": groups, "users": users}
+
+
+# ---------------- QQ OpenID 身份识别（辅助数据源） ----------------
+# 身份资料库 data/qq_identities.json 由机器人自动写入（plugins/identities.py），
+# 只作为「QQ 接收群」「私聊权限」卡片的辅助数据源：在 OpenID 旁展示已识别的
+# 群名/昵称与管理员备注。与白名单/权限机制完全独立，不参与任何放行判断。
+IDENTITIES_FILE = os.path.join(DATA_DIR, "qq_identities.json")
+
+
+def _read_identities():
+    """读取身份资料 dict（缺失/损坏返回 {}）"""
+    try:
+        with open(IDENTITIES_FILE, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        return data if isinstance(data, dict) else {}
+    except Exception:
+        return {}
+
+
+def _identity_items(kind, name_key):
+    """把身份库扁平化为列表 [{openid, name, admin_remark}]"""
+    data = _read_identities()
+    store = data.get(kind, {})
+    if not isinstance(store, dict):
+        store = {}
+    items = []
+    for openid, entry in store.items():
+        if not isinstance(entry, dict):
+            entry = {}
+        items.append({
+            "openid": str(openid),
+            "name": str(entry.get(name_key) or ""),
+            "admin_remark": str(entry.get("admin_remark") or ""),
+        })
+    return items
+
+
+@app.get("/api/identities")
+def api_identities():
+    """返回身份库，供「QQ 接收群」「私聊权限」卡片在 OpenID 旁显示名称/备注"""
+    return {
+        "ok": True,
+        "users": _identity_items("users", "nickname"),
+        "groups": _identity_items("groups", "group_name"),
+    }
+
+
+# ---------------- QQ 注册审核 ----------------
+# 注册申请由机器人写入 data/qq_registrations.json（plugins/registration.py）。
+# 自动发现的 openid 只记录、不进同步名单；主动注册后才进入审核列表。
+# 通过 = 按现有同步流程（sync_discovered_*）加入 settings（默认禁用，
+# 是否放行仍由管理员勾选）；拒绝 = 移除申请，重新注册会再次出现。
+# 注册数据与白名单数据独立存储。
+REGISTRATIONS_FILE = os.path.join(DATA_DIR, "qq_registrations.json")
+
+
+def _read_registrations():
+    try:
+        with open(REGISTRATIONS_FILE, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        if isinstance(data, dict):
+            return data
+    except Exception:
+        pass
+    return {}
+
+
+def _write_registrations(data):
+    atomic_write_json(REGISTRATIONS_FILE, data, indent=2)
+
+
+def _registration_items(kind):
+    """把注册申请扁平化为列表 [{openid, qq_id, nickname/group_name, ...}]，
+    按提交时间排序（旧在前）"""
+    store = _read_registrations().get(kind, {})
+    if not isinstance(store, dict):
+        store = {}
+    items = []
+    for openid, entry in store.items():
+        if not isinstance(entry, dict):
+            continue
+        item = {"openid": str(openid)}
+        for field in ("qq_id", "nickname", "group_name", "operator_openid", "time"):
+            if field in entry:
+                item[field] = entry[field]
+        items.append(item)
+    items.sort(key=lambda x: x.get("time") or 0)
+    return items
+
+
+@app.get("/api/registrations")
+def api_registrations():
+    """返回待审核的注册申请（用户/群），供两个 QQ 同步弹窗展示"""
+    return {
+        "ok": True,
+        "users": _registration_items("users"),
+        "groups": _registration_items("groups"),
+    }
+
+
+def _ensure_discovered(filename, key, openid):
+    """确保 openid 在自动发现记录中：注册必经真实消息事件（openid 已被
+    自动发现过），若发现记录被清理则按注册申请补回，保证 sync_discovered_*
+    能正常把该 openid 加入 settings。"""
+    path = os.path.join(DATA_DIR, filename)
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        if not isinstance(data, dict):
+            data = {}
+    except Exception:
+        data = {}
+    openids = data.setdefault(key, [])
+    if not isinstance(openids, list):
+        openids = []
+        data[key] = openids
+    if str(openid) in openids:
+        return
+    openids.append(str(openid))
+    atomic_write_json(path, data, indent=4)
+
+
+def _fill_registration_info(data, list_key, openid, reg_entry):
+    """审核通过后把注册信息带入对应权限条目（可选字段 name=名称，
+    qq_id=账号）：用户取昵称/QQ号，群取群名/群号。条目不在列表时
+    忽略；旧条目/手动添加的条目没有注册信息时无此字段，面板显示
+    为空，不影响旧配置。remark 等原有字段一律保留不动。"""
+    name = str(reg_entry.get("nickname") or reg_entry.get("group_name") or "")
+    qq_id = str(reg_entry.get("qq_id") or "")
+    for item in data.get(list_key, []):
+        if isinstance(item, dict) and str(item.get("openid")) == str(openid):
+            item["name"] = name
+            item["qq_id"] = qq_id
+            return True
+    return False
+
+
+@app.post("/api/registrations/review")
+async def api_registrations_review(request: Request):
+    """审核注册申请：approve=进入现有同步流程（默认禁用），并把注册
+    信息（名称/账号）带入对应权限条目；reject=移除申请。同一 openid
+    重新注册会再次进入待审。"""
+    try:
+        body = await request.json()
+    except Exception:
+        return JSONResponse({"ok": False, "msg": "数据格式错误"}, status_code=400)
+    kind = str((body or {}).get("kind") or "")
+    openid = str((body or {}).get("openid") or "").strip()
+    action = str((body or {}).get("action") or "")
+    if kind not in ("users", "groups"):
+        return JSONResponse({"ok": False, "msg": "无效的注册类型"}, status_code=400)
+    if not openid:
+        return JSONResponse({"ok": False, "msg": "缺少 openid"}, status_code=400)
+    if action not in ("approve", "reject"):
+        return JSONResponse({"ok": False, "msg": "无效的审核操作"}, status_code=400)
+
+    regs = _read_registrations()
+    store = regs.get(kind)
+    entry = store.pop(openid, None) if isinstance(store, dict) else None
+    if entry is None:
+        return JSONResponse(
+            {"ok": False, "msg": "注册申请不存在或已处理"}, status_code=404
+        )
+
+    added = 0
+    if action == "approve":
+        if kind == "users":
+            _ensure_discovered("qq_user_openids.json", "user_openids", openid)
+            data = load_settings()
+            added = sync_discovered_users(data, [openid])
+            _fill_registration_info(data, "qq_user_openids", openid, entry)
+        else:
+            _ensure_discovered("qq_group_openids.json", "group_openids", openid)
+            data = load_settings()
+            added = sync_discovered_groups(data, [openid])
+            _fill_registration_info(data, "qq_group_openids", openid, entry)
+        save_settings(data)
+
+    _write_registrations(regs)
+    _log("注册审核 kind=%s action=%s openid=%s 加入settings=%s" % (kind, action, openid, added))
+    return {"ok": True, "added": added, "settings": load_settings()}
+
 
 
 @app.post("/api/mode/apply")
@@ -806,6 +1062,37 @@ def api_bot_restart():
     return start_bot()
 
 
+@app.post("/api/panel/restart")
+def api_panel_restart():
+    """重启面板自身：拉起独立 worker 进程，待本进程退出并释放
+    8090 后由 worker 按原启动方式（autostart/双击）拉起新面板。
+
+    面板的路由与静态资源在进程启动时载入内存，改代码后必须
+    重启面板进程才生效；此接口提供一键入口，免去手动杀进程。"""
+    worker = os.path.join(BASE_DIR, "restart_worker.pyw")
+    if not os.path.exists(worker):
+        return {"ok": False, "msg": "缺少 restart_worker.pyw"}
+    flags = getattr(subprocess, "CREATE_NO_WINDOW", 0)
+    env = os.environ.copy()
+    args = [sys.executable, worker]
+    if AUTOSTART_FLAG in sys.argv:
+        args.append(AUTOSTART_FLAG)
+    try:
+        subprocess.Popen(
+            args,
+            cwd=PROJECT_ROOT,
+            creationflags=flags,
+            env=env,
+        )
+    except Exception as exc:
+        _log("重启面板 worker 启动失败: %s" % exc)
+        return {"ok": False, "msg": f"启动重启进程失败: {exc}"}
+    _log("面板重启：worker 已拉起，本进程 2 秒后退出")
+    # 让 HTTP 响应先返回，再退出当前面板进程
+    threading.Timer(2.0, os._exit, args=(0,)).start()
+    return {"ok": True, "msg": "面板正在重启，请稍候刷新页面"}
+
+
 @app.get("/api/bot/loglevel")
 def api_bot_loglevel():
     return {"ok": True, "level": current_log_level()}
@@ -842,6 +1129,11 @@ def api_bot_log_clear():
 
 
 # ---------------- 离线补发（转发到 bot 8082） ----------------
+# _backfill_seq：补发/清除成功一次递增一次，前端轮询 /api/status
+# 发现变化后立即刷新待补发数量（否则最长 5 分钟才更新）。
+_backfill_seq = 0
+
+
 @app.get("/api/backfill/pending")
 def api_backfill_pending():
     running = bot_status()["running"]
@@ -856,21 +1148,27 @@ def api_backfill_pending():
 
 @app.post("/api/backfill/run")
 def api_backfill_run():
+    global _backfill_seq
     if not bot_status()["running"]:
         return {"ok": False, "msg": "机器人未运行"}
     data = bot_api_post("/api/backfill/run")
     if data is None:
         return {"ok": False, "msg": "bot 接口不可用"}
+    if data.get("ok"):
+        _backfill_seq += 1
     return data
 
 
 @app.post("/api/backfill/clear")
 def api_backfill_clear():
+    global _backfill_seq
     if not bot_status()["running"]:
         return {"ok": False, "msg": "机器人未运行"}
     data = bot_api_post("/api/backfill/clear")
     if data is None:
         return {"ok": False, "msg": "bot 接口不可用"}
+    if data.get("ok"):
+        _backfill_seq += 1
     return data
 
 
@@ -909,751 +1207,8 @@ def api_channels_refresh():
     return data
 
 
-# ---------------- 页面 ----------------
-PAGE_HTML = """<!DOCTYPE html>
-<html lang="zh-CN">
-<head>
-<meta charset="utf-8">
-<meta name="viewport" content="width=device-width, initial-scale=1">
-<title>WuppoRelay 管理面板</title>
-<style>
-  * { box-sizing: border-box; }
-  body {
-    margin: 0; padding: 24px;
-    font-family: "Microsoft YaHei", Arial, sans-serif;
-    background: #1e2229; color: #e6e8eb;
-  }
-  h1 { font-size: 22px; margin: 0 0 4px; }
-  .sub { color: #8b93a1; font-size: 13px; margin-bottom: 20px; }
-  .card {
-    background: #272c35; border-radius: 10px;
-    padding: 16px 18px; margin-bottom: 16px;
-  }
-  .card h2 { font-size: 15px; margin: 0 0 12px; color: #aeb6ff; }
-  .row { display: flex; align-items: center; gap: 12px; flex-wrap: wrap; }
-  .badge {
-    padding: 4px 12px; border-radius: 20px; font-size: 13px; font-weight: bold;
-  }
-  .badge.on { background: #1f6f43; color: #b7f7c9; }
-  .badge.off { background: #6b3b3b; color: #ffc9c9; }
-  .badge.warn { background: #6b5b2e; color: #ffe9b0; }
-  .pid { font-size: 13px; color: #8b93a1; }
-  button {
-    background: #5865F2; color: #fff; border: none; border-radius: 6px;
-    padding: 8px 16px; font-size: 14px; cursor: pointer;
-  }
-  button:hover { opacity: .9; }
-  button.sec { background: #2c3240; }
-  button.danger { background: #c0392b; }
-  button.warn { background: #d97706; }
-  button:disabled { opacity: .5; cursor: not-allowed; }
-  button.mode { background: #2c3240; }
-  button.mode.active { background: #5865F2; border-color: #aeb6ff; }
-  button.mode.active::after { content: " ✓"; }
-  table { width: 100%; border-collapse: collapse; font-size: 14px; }
-  th, td { text-align: left; padding: 8px 6px; border-bottom: 1px solid #363d49; }
-  th { color: #8b93a1; font-weight: normal; font-size: 13px; }
-  input[type=text] {
-    background: #1a1f27; border: 1px solid #3a4250; color: #e6e8eb;
-    border-radius: 5px; padding: 6px 8px; font-size: 14px; width: 100%;
-  }
-  input[type=checkbox] { width: 18px; height: 18px; }
-  .mono { font-family: Consolas, monospace; font-size: 12px; }
-  .log {
-    background: #16191f; border-radius: 6px; padding: 10px;
-    font-family: Consolas, monospace; font-size: 12px;
-    white-space: pre-wrap; word-break: break-all; max-height: 260px; overflow: auto;
-  }
-  .addrow { display: flex; gap: 8px; margin-top: 10px; }
-  .addrow input { flex: 1; }
-  .addrow button { flex: none; }
-  .hint { color: #8b93a1; font-size: 12px; margin-top: 8px; }
-  .tip { color: #ffd479; font-size: 12px; }
-  .addgrid { display: grid; gap: 8px; margin-top: 10px; align-items: center; }
-  .addgrid input, .addgrid button { width: 100%; }
-  .delbtn { width: 100%; }
-  .cardrow { display: flex; gap: 16px; align-items: stretch; }
-  .cardrow .card { flex: 1; margin-bottom: 16px; display: flex; flex-direction: column; }
-  .cardrow .card > .hint { margin-top: auto; padding-top: 8px; }
-  .cardrow .card > #autostartContent { flex: 1; display: flex; flex-direction: column; }
-  .cardrow .card > #autostartContent .hint { margin-top: auto; padding-top: 8px; }
-  .foldbtn {
-    background: transparent; color: #8b93a1; padding: 2px 10px;
-    font-size: 14px; border: 1px solid #3a4250; border-radius: 5px;
-  }
-  .foldbtn:hover { color: #fff; border-color: #8b93a1; }
-</style>
-</head>
-<body>
-  <h1>WuppoRelay 管理面板</h1>
-  <div class="sub">Discord → QQ 实时转发 · 本地管理（127.0.0.1:8090）</div>
-
-  <div class="cardrow">
-    <div class="card">
-      <h2>机器人状态</h2>
-      <div class="row">
-        <span id="badge" class="badge off">检测中…</span>
-        <span id="pidinfo" class="pid"></span>
-        <span id="stats" class="pid"></span>
-      </div>
-      <div class="row" style="margin-top:10px;">
-        <button id="btnStart">启动机器人</button>
-        <button id="btnStop" class="danger">停止机器人</button>
-        <button id="btnRestart" class="sec">重启机器人</button>
-      </div>
-      <div class="hint" id="managedHint"></div>
-    </div>
-
-    <div class="card">
-      <h2>模式选择</h2>
-      <div class="row">
-        <button id="modeForward" class="mode">转发模式</button>
-        <button id="modeTest" class="mode">测试模式</button>
-        <button id="modeCustom" class="mode">自定义模式</button>
-      </div>
-      <div class="hint" id="modeHint"></div>
-    </div>
-  </div>
-
-  <div class="card">
-    <h2 style="display:flex;justify-content:space-between;align-items:center;">QQ 接收群 <button class="foldbtn" data-fold="groupContent">▾</button></h2>
-    <div id="groupContent">
-      <table style="table-layout:fixed">
-        <thead><tr><th style="width:64px;text-align:center">启用<br><input type="checkbox" id="groupAllEnabled"></th><th style="width:64px;text-align:center">测试<br><input type="checkbox" id="groupAllTest"></th><th>群 openid</th><th style="width:30%">备注</th><th style="width:100px"></th></tr></thead>
-        <tbody id="groupBody"></tbody>
-      </table>
-      <div class="addgrid" style="grid-template-columns:64px 64px 1fr 30% 100px;">
-        <div></div>
-        <div></div>
-        <input id="newOpenid" placeholder="粘贴群 openid（机器人在群里 @ 后可从日志/qq_group_openids.json 获取）">
-        <input id="newRemark" placeholder="备注（可选）">
-        <button id="btnAddGroup">添加</button>
-      </div>
-      <div class="row addrow">
-        <button id="btnSync" class="sec">同步自动发现的群</button>
-        <button id="btnQQPlatform" class="sec">QQ 开放平台管理页</button>
-      </div>
-      <div class="hint">勾选 = 该群接收 Discord 转发消息；修改后立即生效，无需重启。</div>
-    </div>
-  </div>
-
-  <div class="card">
-    <h2 style="display:flex;justify-content:space-between;align-items:center;">Discord 转发频道 <button class="foldbtn" data-fold="chanContent">▾</button></h2>
-    <div id="chanContent">
-      <table style="table-layout:fixed">
-        <thead><tr><th style="width:64px;text-align:center">启用<br><input type="checkbox" id="chanAllEnabled"></th><th style="width:64px;text-align:center">测试<br><input type="checkbox" id="chanAllTest"></th><th>频道名称</th><th>真实名称</th><th>频道 ID</th><th style="width:100px"></th></tr></thead>
-        <tbody id="chanBody"></tbody>
-      </table>
-      <div class="addgrid" style="grid-template-columns:64px 64px 1fr 1fr 1fr 100px;">
-        <div></div>
-        <div></div>
-        <input id="newChanName" placeholder="频道名称">
-        <div></div>
-        <input id="newChanId" placeholder="频道 ID">
-        <button id="btnAddChan">添加</button>
-      </div>
-      <div class="row addrow">
-        <button id="btnSyncChannels" class="sec">同步可读频道</button>
-        <button id="btnDiscordDev" class="sec">Discord开发者门户</button>
-      </div>
-      <div class="hint">勾选 = 该频道消息会转发到已启用的 QQ 群，立即生效。点"同步可读频道"可自动加入 Bot 有读取权限的频道（默认不启用）。</div>
-    </div>
-  </div>
-
-  <div class="card">
-    <h2 style="display:flex;justify-content:space-between;align-items:center;">私聊权限 <button class="foldbtn" data-fold="userContent">▾</button></h2>
-    <div id="userContent">
-      <table style="table-layout:fixed">
-        <thead><tr><th style="width:64px;text-align:center">启用<br><input type="checkbox" id="userAllEnabled"></th><th>用户 openid</th><th style="width:30%">备注</th><th style="width:100px"></th></tr></thead>
-        <tbody id="userBody"></tbody>
-      </table>
-      <div class="row addrow">
-        <button id="btnSyncUsers" class="sec">同步自动发现的用户</button>
-      </div>
-      <div class="hint">仅勾选的用户可私聊使用 relay 命令；用户私聊机器人后 openid 自动记录，可点"同步自动发现的用户"加入列表。</div>
-    </div>
-  </div>
-
-  <div class="cardrow">
-  <div class="card">
-    <h2>离线补发</h2>
-    <div id="backfillContent">
-      <div class="row" style="gap:20px;align-items:center;flex-wrap:wrap;">
-        <label class="row" style="gap:8px;align-items:center;cursor:pointer;">
-          <input type="checkbox" id="backfillEnabled" style="width:16px;height:16px;">
-          <span>启用补发</span>
-        </label>
-        <label class="row" style="gap:8px;align-items:center;">
-          <span>单次补发上限</span>
-          <input type="number" id="backfillLimit" min="1" step="1" style="width:90px;background:#1a1f27;border:1px solid #3a4250;color:#e6e8eb;border-radius:5px;padding:6px 8px;font-size:13px;">
-          <span>条/频道</span>
-        </label>
-        <span class="row" style="gap:8px;align-items:center;margin-left:auto;">
-          <span>待补发</span>
-          <b id="backfillPending">—</b>
-        </span>
-      </div>
-      <div class="row" style="margin-top:10px;">
-        <button id="btnBackfillRun" class="sec">立即补发</button>
-        <button id="btnBackfillClear" class="warn" style="margin-left:auto">清除待补发</button>
-      </div>
-      <div class="hint">启用后，机器人每次连接自动补发离线期间未转发的消息；清除待补发后不再补发旧消息。</div>
-    </div>
-  </div>
-
-  <div class="card">
-    <h2>开机自启</h2>
-    <div id="autostartContent">
-      <div class="row" style="margin-top:10px;">
-        <label style="display:flex; align-items:center; gap:8px; font-size:13px; cursor:pointer;">
-          <input type="checkbox" id="chkAutostart" style="width:16px;height:16px;">
-          开机自动启动机器人（后台运行，不打开面板）
-        </label>
-      </div>
-      <div class="hint">启用后，Windows 开机时机器人在后台自动运行，不打开面板窗口。</div>
-    </div>
-  </div>
-  </div>
-
-  <div class="card">
-    <h2 style="display:flex;justify-content:space-between;align-items:center;">运行日志 <button class="foldbtn" data-fold="logContent">▾</button></h2>
-    <div id="logContent">
-      <pre id="log" class="log">加载中…</pre>
-      <div class="row" style="margin-top:10px;">
-        <select id="logLevel" style="background:#1a1f27;border:1px solid #3a4250;color:#e6e8eb;border-radius:5px;padding:6px 8px;font-size:13px;">
-          <option value="DEBUG">DEBUG</option>
-          <option value="INFO">INFO</option>
-          <option value="WARNING">WARNING</option>
-          <option value="ERROR">ERROR</option>
-        </select>
-        <button id="btnLogLevel" class="sec">应用日志级别</button>
-        <button id="btnClearLog" class="sec">清空日志</button>
-      </div>
-    </div>
-  </div>
-
-<script>
-let settings = null;
-// Discord 频道真实名称映射 {频道ID: 真实名}，由 /api/channel-names 拉取（仅展示，不写入 settings）
-let channelNames = {};
-
-async function jget(url) {
-  const r = await fetch(url);
-  return r.json();
-}
-async function jpost(url, body) {
-  const r = await fetch(url, {
-    method: "POST",
-    headers: {"Content-Type": "application/json"},
-    body: body ? JSON.stringify(body) : undefined,
-  });
-  return r.json();
-}
-
-function renderStatus(st) {
-  const b = document.getElementById("badge");
-  if (st.running) {
-    document.getElementById("btnStart").disabled = true;
-    document.getElementById("btnStop").disabled = false;
-    document.getElementById("btnRestart").disabled = false;
-    const h = st.health;
-    if (h && h.discord && h.qq) {
-      b.textContent = "运行中";
-      b.className = "badge on";
-    } else if (h) {
-      b.textContent = h.discord ? "运行中（QQ 未连接）" : h.qq ? "运行中（Discord 未连接）" : "运行中（未连接）";
-      b.className = "badge warn";
-    } else {
-      b.textContent = "运行中（检测中…）";
-      b.className = "badge warn";
-    }
-  } else {
-    b.textContent = "已停止";
-    b.className = "badge off";
-    document.getElementById("btnStart").disabled = false;
-    document.getElementById("btnStop").disabled = true;
-    document.getElementById("btnRestart").disabled = true;
-  }
-  document.getElementById("pidinfo").textContent = st.pid ? ("PID: " + st.pid) : "";
-  const stats = st.stats || {};
-  const statsEl = document.getElementById("stats");
-  statsEl.textContent = (stats.total_forwarded || stats.total_failed)
-    ? ("今日转发 " + (stats.today_forwarded || 0) + " 条 · 累计 " + (stats.total_forwarded || 0) + " 条 · 失败 " + (stats.total_failed || 0) + " 条")
-    : "";
-  const lvlEl = document.getElementById("logLevel");
-  if (lvlEl && st.level) lvlEl.value = st.level;
-  const hint = document.getElementById("managedHint");
-  hint.textContent = st.running && !st.managed
-    ? "检测到机器人可能由其他方式启动，本面板无法完全控制；如需接管请先手动停止。"
-    : "";
-  document.getElementById("log").textContent = st.log || "（暂无日志）";
-  const el = document.getElementById("log");
-  el.scrollTop = el.scrollHeight;
-  renderMode(st.mode);
-  var autoEl = document.getElementById("chkAutostart");
-  if (autoEl) autoEl.checked = !!st.autostart;
-}
-
-var MODE_INFO = {
-  test:     { btn: "modeTest",     name: "测试模式", hint: "仅启用测试群与测试频道" },
-  forward:  { btn: "modeForward",  name: "转发模式", hint: "选中所有非测试群与非测试频道" },
-  custom:   { btn: "modeCustom",   name: "自定义模式", hint: "按当前手动勾选配置" }
-};
-
-function renderMode(mode) {
-  var info = MODE_INFO[mode] || MODE_INFO.custom;
-  var gs = (settings && settings.qq_group_openids) || [];
-  var cs = (settings && settings.discord_channels) || [];
-  var hasTestG = gs.some(function (g) { return g.is_test; });
-  var hasTestC = cs.some(function (c) { return c.is_test; });
-  var hasNontestG = gs.some(function (g) { return !g.is_test; });
-  var hasNontestC = cs.some(function (c) { return !c.is_test; });
-  document.getElementById("modeTest").disabled = !(hasTestG && hasTestC);
-  document.getElementById("modeForward").disabled = !(hasNontestG && hasNontestC);
-  ["modeTest", "modeForward", "modeCustom"].forEach(function (id) {
-    document.getElementById(id).classList.toggle("active", id === info.btn);
-  });
-  var tips = [];
-  if (!(hasTestG && hasTestC)) tips.push("测试模式需至少 1 个测试群和 1 个测试频道");
-  if (!(hasNontestG && hasNontestC)) tips.push("转发模式需至少 1 个非测试群和 1 个非测试频道");
-  document.getElementById("modeHint").textContent =
-    "当前模式：" + info.name + " · " + info.hint +
-    (tips.length ? " · " + tips.join("；") : "");
-}
-
-function renderSettings() {
-  const gb = document.getElementById("groupBody");
-  gb.innerHTML = "";
-  settings.qq_group_openids.forEach((g, i) => {
-    const tr = document.createElement("tr");
-    tr.innerHTML =
-      '<td style="text-align:center"><input type="checkbox" data-kind="group" data-i="' + i + '"' + (g.enabled ? " checked" : "") + '></td>' +
-      '<td style="text-align:center"><input type="checkbox" data-kind="groupIsTest" data-i="' + i + '"' + (g.is_test ? " checked" : "") + '></td>' +
-      '<td class="mono">' + escapeHtml(g.openid) + '</td>' +
-      '<td><input type="text" value="' + escapeHtml(g.remark || "") + '" data-kind="groupRemark" data-i="' + i + '"></td>' +
-      '<td><button class="sec delbtn" data-kind="groupDel" data-i="' + i + '">删除</button></td>';
-    gb.appendChild(tr);
-  });
-  const cb = document.getElementById("chanBody");
-  cb.innerHTML = "";
-  settings.discord_channels.forEach((c, i) => {
-    const tr = document.createElement("tr");
-    tr.innerHTML =
-      '<td style="text-align:center"><input type="checkbox" data-kind="chan" data-i="' + i + '"' + (c.enabled ? " checked" : "") + '></td>' +
-      '<td style="text-align:center"><input type="checkbox" data-kind="chanIsTest" data-i="' + i + '"' + (c.is_test ? " checked" : "") + '></td>' +
-      '<td><input type="text" value="' + escapeHtml(c.name || "") + '" data-kind="chanName" data-i="' + i + '"></td>' +
-      '<td>' + escapeHtml(channelNames[c.id] || "-") + '</td>' +
-      '<td class="mono">' + escapeHtml(c.id) + '</td>' +
-      '<td><button class="sec delbtn" data-kind="chanDel" data-i="' + i + '">删除</button></td>';
-    cb.appendChild(tr);
-  });
-  const ub = document.getElementById("userBody");
-  if (ub) {
-    ub.innerHTML = "";
-    (settings.qq_user_openids || []).forEach((u, i) => {
-      const tr = document.createElement("tr");
-      tr.innerHTML =
-        '<td style="text-align:center"><input type="checkbox" data-kind="user" data-i="' + i + '"' + (u.enabled ? " checked" : "") + '></td>' +
-        '<td class="mono">' + escapeHtml(u.openid) + '</td>' +
-        '<td><input type="text" value="' + escapeHtml(u.remark || "") + '" data-kind="userRemark" data-i="' + i + '"></td>' +
-        '<td><button class="sec delbtn" data-kind="userDel" data-i="' + i + '">删除</button></td>';
-      ub.appendChild(tr);
-    });
-  }
-  // 离线补发设置
-  const bfEnabled = document.getElementById("backfillEnabled");
-  if (bfEnabled) bfEnabled.checked = settings.backfill_enabled !== false;
-  const bfLimit = document.getElementById("backfillLimit");
-  if (bfLimit) bfLimit.value = Number(settings.backfill_limit) > 0 ? settings.backfill_limit : 10;
-  // 表头全选框状态：全部勾选→勾选，全部取消→取消，部分→半选
-  syncHeaderAll("groupAllEnabled", settings.qq_group_openids || [], "enabled");
-  syncHeaderAll("groupAllTest", settings.qq_group_openids || [], "is_test");
-  syncHeaderAll("chanAllEnabled", settings.discord_channels || [], "enabled");
-  syncHeaderAll("chanAllTest", settings.discord_channels || [], "is_test");
-  syncHeaderAll("userAllEnabled", settings.qq_user_openids || [], "enabled");
-}
-
-function syncHeaderAll(id, items, field) {
-  const el = document.getElementById(id);
-  if (!el) return;
-  if (!items.length) {
-    el.checked = false;
-    el.indeterminate = false;
-    return;
-  }
-  const on = items.filter(function (o) { return o[field]; }).length;
-  el.checked = on === items.length;
-  el.indeterminate = on > 0 && on < items.length;
-}
-
-function escapeHtml(s) {
-  return String(s).replace(/[&<>"']/g, function (c) {
-    return {"&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;"}[c];
-  });
-}
-
-function renderBackfill(data) {
-  const el = document.getElementById("backfillPending");
-  if (!el) return;
-  if (!data || !data.ok) {
-    el.textContent = data && data.running === false ? "机器人未运行" : "—";
-    return;
-  }
-  const total = data.total || 0;
-  el.textContent = total > 0 ? ("共 " + total + " 条") : "无";
-  el.style.color = total > 0 ? "#e5b567" : "";
-}
-
-async function refreshBackfill() {
-  try {
-    const r = await jget("/api/backfill/pending");
-    renderBackfill(r);
-  } catch (err) {
-    renderBackfill(null);
-  }
-}
-
-async function refreshChannelNames() {
-  try {
-    const r = await jget("/api/channel-names");
-    if (r && r.names) channelNames = r.names || {};
-  } catch (err) { /* ignore */ }
-  renderSettings();
-}
-
-// ---------- 通用弹窗（confirmModal：alert / confirm / 勾选确认） ----------
-let confirmAction = null;
-
-function setConfirmButtons(okText, showCancel) {
-  document.getElementById("confirmOk").textContent = okText;
-  document.getElementById("confirmCancel").style.display = showCancel ? "" : "none";
-}
-
-function showAlert(title, message) {
-  document.getElementById("confirmTitle").textContent = title;
-  const body = document.getElementById("confirmBody");
-  body.innerHTML = "";
-  const p = document.createElement("div");
-  p.style.whiteSpace = "pre-wrap";
-  p.textContent = message;
-  body.appendChild(p);
-  setConfirmButtons("确定", false);
-  confirmAction = null;
-  document.getElementById("confirmModal").style.display = "flex";
-}
-
-function showConfirmDlg(title, message, onOk) {
-  document.getElementById("confirmTitle").textContent = title;
-  const body = document.getElementById("confirmBody");
-  body.innerHTML = "";
-  const p = document.createElement("div");
-  p.style.whiteSpace = "pre-wrap";
-  p.textContent = message;
-  body.appendChild(p);
-  setConfirmButtons("确定", true);
-  confirmAction = onOk;
-  document.getElementById("confirmModal").style.display = "flex";
-}
-
-function showConfirmSelect(title, items, labelFn, onOkSelected) {
-  document.getElementById("confirmTitle").textContent = title;
-  const body = document.getElementById("confirmBody");
-  body.innerHTML = "";
-  const rows = [];
-  items.forEach(function (it) {
-    const row = document.createElement("label");
-    row.style.display = "flex";
-    row.style.alignItems = "center";
-    row.style.gap = "8px";
-    row.style.cursor = "pointer";
-    row.style.padding = "2px 0";
-    const cb = document.createElement("input");
-    cb.type = "checkbox";
-    cb.checked = true;
-    cb.style.width = "16px";
-    cb.style.height = "16px";
-    const span = document.createElement("span");
-    span.className = "mono";
-    span.textContent = labelFn(it);
-    row.appendChild(cb);
-    row.appendChild(span);
-    body.appendChild(row);
-    rows.push({it: it, cb: cb});
-  });
-  setConfirmButtons("确认添加", true);
-  confirmAction = function () {
-    const selected = rows.filter(function (b) { return b.cb.checked; }).map(function (b) { return b.it; });
-    return onOkSelected(selected);
-  };
-  document.getElementById("confirmModal").style.display = "flex";
-}
-
-function hideConfirm() {
-  document.getElementById("confirmModal").style.display = "none";
-  confirmAction = null;
-  setConfirmButtons("确定", true);
-}
-
-async function saveAndReload() {
-  await jpost("/api/settings/save", settings);
-  settings = await jget("/api/settings");
-  renderSettings();
-  await refreshChannelNames();
-  await refreshStatus();
-}
-
-document.addEventListener("click", async function (e) {
-  const btn = e.target.closest("button");
-  if (!btn) return;
-  if (btn.id === "confirmOk") {
-    const fn = confirmAction;
-    hideConfirm();
-    if (fn) await fn();
-    return;
-  }
-  if (btn.id === "confirmCancel") {
-    hideConfirm();
-    return;
-  }
-  if (btn.dataset.fold) {
-    const el = document.getElementById(btn.dataset.fold);
-    const folded = el.style.display === "none";
-    el.style.display = folded ? "" : "none";
-    btn.textContent = folded ? "▾" : "▸";
-    return;
-  }
-  const k = btn.dataset.kind;
-  if (k === "groupDel") {
-    settings.qq_group_openids.splice(Number(btn.dataset.i), 1);
-    await saveAndReload();
-  } else if (k === "userDel") {
-    settings.qq_user_openids.splice(Number(btn.dataset.i), 1);
-    await saveAndReload();
-  } else if (k === "chanDel") {
-    settings.discord_channels.splice(Number(btn.dataset.i), 1);
-    await saveAndReload();
-  } else if (btn.id === "btnAddGroup") {
-    const oid = document.getElementById("newOpenid").value.trim();
-    if (!oid) return showAlert("输入提示", "请填写群 openid");
-    settings.qq_group_openids.push({openid: oid, enabled: true, remark: document.getElementById("newRemark").value.trim(), is_test: false});
-    document.getElementById("newOpenid").value = "";
-    document.getElementById("newRemark").value = "";
-    await saveAndReload();
-  } else if (btn.id === "btnAddChan") {
-    const id = document.getElementById("newChanId").value.trim();
-    if (!id) return showAlert("输入提示", "请填写频道 ID");
-    settings.discord_channels.push({id: id, name: document.getElementById("newChanName").value.trim(), enabled: true, is_test: false});
-    document.getElementById("newChanId").value = "";
-    document.getElementById("newChanName").value = "";
-    await saveAndReload();
-  } else if (btn.id === "btnSync") {
-    const r = await jpost("/api/settings/sync/preview");
-    const groups = (r && r.groups) || [];
-    if (!groups.length) { showAlert("同步结果", "没有发现新群"); return; }
-    showConfirmSelect("勾选要添加的新群（共 " + groups.length + " 个）", groups, function (o) { return o; }, async function (selected) {
-      if (!selected.length) { showAlert("同步结果", "未选择任何群"); return; }
-      const rr = await jpost("/api/settings/sync", {kind: "groups", openids: selected});
-      showAlert("同步结果", rr.added ? ("已同步 " + rr.added + " 个新群（默认未启用）") : "没有发现新群");
-      settings = rr.settings;
-      renderSettings();
-    });
-  } else if (btn.id === "btnSyncUsers") {
-    const r = await jpost("/api/settings/sync/preview");
-    const users = (r && r.users) || [];
-    if (!users.length) { showAlert("同步结果", "没有发现新用户"); return; }
-    showConfirmSelect("勾选要添加的新用户（共 " + users.length + " 个）", users, function (o) { return o; }, async function (selected) {
-      if (!selected.length) { showAlert("同步结果", "未选择任何用户"); return; }
-      const rr = await jpost("/api/settings/sync", {kind: "users", openids: selected});
-      showAlert("同步结果", rr.added ? ("已同步 " + rr.added + " 个新用户（默认未启用）") : "没有发现新用户");
-      settings = rr.settings;
-      renderSettings();
-    });
-  } else if (btn.id === "btnQQPlatform") {
-    window.open("https://q.qq.com/qqbot/dashboard/", "_blank");
-  } else if (btn.id === "btnLogLevel") {
-    const level = document.getElementById("logLevel").value;
-    const r = await jpost("/api/bot/loglevel", {level: level});
-    if (!r.ok) showAlert("设置失败", r.msg || "设置失败");
-    await refreshStatus();
-  } else if (btn.id === "btnDiscordDev") {
-    window.open("https://discord.com/developers/home", "_blank");
-  } else if (btn.id === "btnSyncChannels") {
-    // 扫描 Bot 可读取内容的频道，弹窗勾选后再加入转发列表（默认未启用）
-    const r = await jpost("/api/channels/refresh");
-    if (!r.ok) { showAlert("扫描失败", r.msg || "扫描失败"); return; }
-    const list = (r.audit && r.audit.readable) || [];
-    const known = {};
-    settings.discord_channels.forEach(function (c) { known[String(c.id)] = true; });
-    const pending = list.filter(function (ch) { return !known[String(ch.id)]; });
-    if (!pending.length) { showAlert("同步结果", "没有发现新频道"); return; }
-    showConfirmSelect("勾选要添加的新频道（共 " + pending.length + " 个）", pending, function (ch) { return ch.name + " (" + ch.id + ")"; }, async function (selected) {
-      if (!selected.length) { showAlert("同步结果", "未选择任何频道"); return; }
-      let added = 0;
-      selected.forEach(function (ch) {
-        const id = String(ch.id);
-        if (known[id]) return;
-        settings.discord_channels.push({id: id, name: String(ch.name || "").replace(/^#/, ""), enabled: false, is_test: false});
-        known[id] = true;
-        added++;
-      });
-      if (added) {
-        await saveAndReload();
-      } else {
-        renderSettings();
-      }
-      showAlert("同步结果", "已同步 " + added + " 个新频道（默认未启用）");
-    });
-  } else if (btn.id === "btnClearLog") {
-    const r = await jpost("/api/bot/log/clear");
-    if (!r.ok) showAlert("清空失败", r.msg || "清空失败");
-    await refreshStatus();
-  } else if (btn.id === "btnBackfillRun") {
-    const r = await jpost("/api/backfill/run");
-    showAlert("补发", r.ok ? (r.msg || "补发已触发") : (r.msg || "补发失败"));
-    await refreshBackfill();
-  } else if (btn.id === "btnBackfillClear") {
-    showConfirmDlg("清除待补发", "清除待补发？未转发的旧消息将不再补发，此操作不可撤销。", async function () {
-      const r = await jpost("/api/backfill/clear");
-      showAlert("清除结果", r.ok ? ("已清除 " + (r.cleared || 0) + " 个频道的待补发") : (r.msg || "清除失败"));
-      await refreshBackfill();
-    });
-  } else if (btn.id === "btnStart") {
-    await jpost("/api/bot/start");
-    await sleep(800); await refreshStatus();
-  } else if (btn.id === "btnStop") {
-    await jpost("/api/bot/stop");
-    await sleep(800); await refreshStatus();
-  } else if (btn.id === "btnRestart") {
-    await jpost("/api/bot/restart");
-    await sleep(1500); await refreshStatus();
-  } else if (btn.id === "modeTest" || btn.id === "modeForward" || btn.id === "modeCustom") {
-    const mode = {modeTest: "test", modeForward: "forward", modeCustom: "custom"}[btn.id];
-    const r = await jpost("/api/mode/apply", {mode: mode});
-    if (r.ok) {
-      settings = r.settings;
-      renderSettings();
-    }
-    await refreshStatus();
-  }
-});
-
-document.addEventListener("change", async function (e) {
-  const el = e.target;
-  if (el.id === "chkAutostart") {
-    const r = await jpost("/api/autostart/set", {enabled: el.checked});
-    if (!r.ok) showAlert("设置失败", "设置开机自启失败");
-    el.checked = !!r.enabled;
-    return;
-  }
-  if (el.id === "backfillEnabled") {
-    settings.backfill_enabled = el.checked;
-    await saveAndReload();
-    return;
-  }
-  if (el.id === "backfillLimit") {
-    let v = parseInt(el.value, 10);
-    if (!(v > 0)) v = 10;
-    settings.backfill_limit = v;
-    el.value = v;
-    await saveAndReload();
-    return;
-  }
-  if (el.id === "groupAllEnabled") {
-    settings.qq_group_openids.forEach(function (g) { g.enabled = el.checked; });
-    await saveAndReload();
-    return;
-  }
-  if (el.id === "groupAllTest") {
-    settings.qq_group_openids.forEach(function (g) { g.is_test = el.checked; });
-    await saveAndReload();
-    return;
-  }
-  if (el.id === "chanAllEnabled") {
-    settings.discord_channels.forEach(function (c) { c.enabled = el.checked; });
-    await saveAndReload();
-    return;
-  }
-  if (el.id === "chanAllTest") {
-    settings.discord_channels.forEach(function (c) { c.is_test = el.checked; });
-    await saveAndReload();
-    return;
-  }
-  if (el.id === "userAllEnabled") {
-    settings.qq_user_openids.forEach(function (u) { u.enabled = el.checked; });
-    await saveAndReload();
-    return;
-  }
-  if (!el.dataset.kind) return;
-  if (el.dataset.kind === "group") {
-    settings.qq_group_openids[Number(el.dataset.i)].enabled = el.checked;
-    await saveAndReload();
-  } else if (el.dataset.kind === "groupIsTest") {
-    settings.qq_group_openids[Number(el.dataset.i)].is_test = el.checked;
-    await saveAndReload();
-  } else if (el.dataset.kind === "chan") {
-    settings.discord_channels[Number(el.dataset.i)].enabled = el.checked;
-    await saveAndReload();
-  } else if (el.dataset.kind === "chanIsTest") {
-    settings.discord_channels[Number(el.dataset.i)].is_test = el.checked;
-    await saveAndReload();
-  } else if (el.dataset.kind === "user") {
-    settings.qq_user_openids[Number(el.dataset.i)].enabled = el.checked;
-    await saveAndReload();
-  }
-});
-
-document.addEventListener("blur", async function (e) {
-  const el = e.target;
-  if (el.dataset.kind === "groupRemark") {
-    settings.qq_group_openids[Number(el.dataset.i)].remark = el.value;
-    await saveAndReload();
-  } else if (el.dataset.kind === "userRemark") {
-    settings.qq_user_openids[Number(el.dataset.i)].remark = el.value;
-    await saveAndReload();
-  } else if (el.dataset.kind === "chanName") {
-    settings.discord_channels[Number(el.dataset.i)].name = el.value;
-    await saveAndReload();
-  }
-}, true);
-
-function sleep(ms) { return new Promise(function (r) { setTimeout(r, ms); }); }
-
-async function refreshStatus() {
-  try {
-    const st = await jget("/api/status");
-    renderStatus(st);
-  } catch (err) {
-    document.getElementById("badge").textContent = "面板连接断开";
-  }
-}
-
-async function init() {
-  try {
-    settings = await jget("/api/settings");
-    renderSettings();
-  } catch (err) { /* ignore */ }
-  await refreshChannelNames();
-  await refreshStatus();
-  setInterval(refreshStatus, 3000);
-  await refreshBackfill();
-  setInterval(refreshBackfill, 300000);
-}
-
-init();
-</script>
-<div id="confirmModal" style="display:none;position:fixed;inset:0;background:rgba(0,0,0,.55);z-index:999;align-items:center;justify-content:center;">
-  <div style="background:#1e2330;border:1px solid #3a4150;border-radius:10px;padding:18px;max-width:480px;width:90%;max-height:70vh;display:flex;flex-direction:column;">
-    <h3 id="confirmTitle" style="margin:0 0 10px;"></h3>
-    <div id="confirmBody" style="overflow:auto;flex:1;margin:0 0 12px;line-height:1.8;"></div>
-    <div style="display:flex;gap:10px;justify-content:flex-end;">
-      <button id="confirmOk">确认添加</button>
-      <button id="confirmCancel" class="sec">取消</button>
-    </div>
-  </div>
-</div>
-</body>
-</html>
-"""
+# ---------------- 静态页面 ----------------
+app.mount("/", StaticFiles(directory=os.path.join(BASE_DIR, "web"), html=True), name="web")
 
 
 # ---------------- 启动 ----------------
