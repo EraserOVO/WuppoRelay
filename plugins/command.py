@@ -1,3 +1,6 @@
+import datetime
+import time
+
 from nonebot import logger
 from nonebot import on_message
 from nonebot import on_notice
@@ -10,6 +13,7 @@ from nonebot.adapters.qq.event import (
     GroupMessageCreateEvent,
 )
 
+from plugins import identities
 from plugins.config import (
     get_active_groups,
     get_all_channels,
@@ -113,6 +117,35 @@ def save_user_openid(openid):
     )
 
 
+# =====================================================
+# OpenID 身份记录
+#
+# 在自动发现 openid 的同时，把昵称/群名、最后活动时间记录到
+# data/qq_identities.json（独立于白名单的身份资料库）。名称只
+# 用于面板展示识别，绝不参与放行判断（qq_user_openids 仍是唯一
+# 权限来源）。新发现的用户只记录身份，不会自动加入白名单。
+#
+# 昵称取事件自带（FriendAuthor/GroupMemberAuthor.username），
+# 缺失时保持「未命名」，由面板兜底显示并允许手动备注。
+# QQ 官方 API 不提供群名/昵称查询接口，无法主动补全。
+# =====================================================
+
+def _event_ts(event):
+    """取事件时间（秒）；QQ 时间戳可能是 ms / datetime / str"""
+    ts = getattr(event, "timestamp", None)
+    if isinstance(ts, datetime.datetime):
+        return ts.timestamp()
+    if isinstance(ts, (int, float)):
+        return ts / 1000.0 if ts > 1e12 else ts
+    if isinstance(ts, str):
+        try:
+            v = float(ts)
+            return v / 1000.0 if v > 1e12 else v
+        except ValueError:
+            pass
+    return time.time()
+
+
 openid_logger = on_message(
     priority=1,
     block=False
@@ -136,8 +169,25 @@ async def log_group_message_openid(
         C2CMessageCreateEvent
     ):
 
+        openid = event.author.user_openid
+
         save_user_openid(
-            event.author.user_openid
+            openid
+        )
+
+        # 记录身份：昵称取事件自带，缺失时保持未命名
+        username = str(
+            getattr(
+                event.author,
+                "username",
+                ""
+            ) or ""
+        ).strip()
+
+        identities.record_user_identity(
+            openid,
+            nickname=username or None,
+            last_active=_event_ts(event),
         )
 
         return
@@ -150,6 +200,11 @@ async def log_group_message_openid(
 
     save_group_openid(
         event.group_openid
+    )
+
+    identities.record_group_identity(
+        event.group_openid,
+        last_active=_event_ts(event),
     )
 
 
@@ -179,6 +234,11 @@ async def log_group_add_openid(
 
     save_group_openid(
         event.group_openid
+    )
+
+    identities.record_group_identity(
+        event.group_openid,
+        last_active=_event_ts(event),
     )
 
 
@@ -222,11 +282,8 @@ async def handle(
         "relay "
     ):
 
-        await bot.send(
-            event,
-            "指令无效"
-        )
-
+        # 非 relay 私聊消息由 plugins/manage.py 统一处理
+        # （命令识别与未知命令回复），这里保持静默
         return
 
 
