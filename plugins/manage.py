@@ -164,7 +164,8 @@ def _help_text():
 def _group_help_text():
     return (
         "【群聊命令】\n"
-        "register-group {群号} {群名称} 群内提交群注册申请"
+        "register-group {群号} {群名称} 群内提交群注册申请\n"
+        "转发 relay 转发你最近一条消息到其他QQ群"
     )
 
 
