@@ -138,13 +138,108 @@ function toggleFgMember(fg, id, field, on) {
   if (on && idx < 0) arr.push(idStr);
   if (!on && idx >= 0) arr.splice(idx, 1);
 }
-function purgeFgMember(id, field) {
-  // 删除频道/群后清理所有转发组里的引用，不留悬空 ID
+function removeFgMember(id, field) {
+  // 只把实体从当前转发组移除（脱组）：不删全局实体、不影响其他组
+  const fg = getActiveFg();
+  if (!fg) return;
   const idStr = String(id);
-  getFgList().forEach(function (fg) {
-    const arr = fg[field] || [];
-    const idx = arr.indexOf(idStr);
-    if (idx >= 0) arr.splice(idx, 1);
+  const arr = fg[field] || [];
+  const idx = arr.indexOf(idStr);
+  if (idx >= 0) arr.splice(idx, 1);
+  saveAndReload();
+}
+function openFgAddPicker(kind) {
+  // 「从已注册项新增」：从全局已发现/已注册实体中选择加入当前转发组
+  const fg = getActiveFg();
+  if (!fg) return;
+  const isGroup = kind === "group";
+  const field = isGroup ? "groups" : "channels";
+  const memberSet = {};
+  (fg[field] || []).forEach(function (id) { memberSet[String(id)] = true; });
+  const all = isGroup ? settings.qq_group_openids : settings.discord_channels;
+  const candidates = all.filter(function (item) {
+    const id = isGroup ? String(item.openid) : String(item.id);
+    return !memberSet[id];
+  });
+  if (!candidates.length) {
+    showAlert(
+      "从已注册项新增",
+      "当前转发组已包含全部已发现/已注册的" + (isGroup ? "群" : "频道") + "，没有可添加的条目"
+    );
+    return;
+  }
+  showConfirmSelect(
+    "已注册项",
+    candidates,
+    function (item) {
+      if (isGroup) {
+        const gname = item.name || item.remark || identityName("groups", item.openid) || "";
+        return (gname + " " + item.openid).trim();
+      }
+      const cname = item.name || "";
+      return (cname + " " + item.id).trim();
+    },
+    async function (selected) {
+      selected.forEach(function (item) {
+        toggleFgMember(fg, isGroup ? item.openid : item.id, field, true);
+      });
+      await saveAndReload();
+    }
+  );
+}
+let fgAddKind = null;
+function openFgAddChooser(kind) {
+  // 「＋ 新增」合并入口：Discord 提供 从全部可读频道 / 从已注册项 / 手动；
+  // QQ 提供 从已注册项 / 手动。
+  fgAddKind = kind;
+  const isGroup = kind === "group";
+  document.getElementById("fgAddTitle").textContent = isGroup ? "新增群" : "新增频道";
+  const scanBtn = document.getElementById("fgAddScan");
+  if (scanBtn) scanBtn.style.display = isGroup ? "none" : "";
+  document.getElementById("fgAddModal").style.display = "flex";
+}
+function hideFgAddChooser() {
+  document.getElementById("fgAddModal").style.display = "none";
+}
+// 「从全部可读频道新增」处理中：整个二级窗口按钮全部禁用（CSS button:disabled 提供半透明效果），
+// 防止处理期间重复触发请求。
+function setFgAddModalBusy(busy) {
+  const modal = document.getElementById("fgAddModal");
+  if (!modal) return;
+  modal.querySelectorAll("button").forEach(function (b) { b.disabled = busy; });
+}
+// 「从全部可读频道新增」：整合原「同步可读频道」——扫描 Bot 可读的频道，
+// 弹窗勾选后登记为全局频道（默认未启用，不自动加入当前转发组）。
+async function scanReadableChannels(btn) {
+  if (btn) btn.disabled = true;
+  let r;
+  try {
+    r = await jpost("/api/channels/refresh");
+  } finally {
+    if (btn) btn.disabled = false;
+  }
+  if (!r.ok) { showAlert("扫描失败", r.msg || "扫描失败"); return; }
+  const list = (r.audit && r.audit.readable) || [];
+  const known = {};
+  settings.discord_channels.forEach(function (c) { known[String(c.id)] = true; });
+  const pending = list.filter(function (ch) { return !known[String(ch.id)]; });
+  if (!pending.length) { showAlert("同步结果", "没有发现新频道"); return; }
+  showConfirmSelect("全部可读频道", pending, function (ch) { return ch.name + " (" + ch.id + ")"; }, async function (selected) {
+    if (!selected.length) { showAlert("同步结果", "未选择任何频道"); return; }
+    let added = 0;
+    selected.forEach(function (ch) {
+      const id = String(ch.id);
+      if (known[id]) return;
+      settings.discord_channels.push({id: id, name: String(ch.name || "").replace(/^#/, ""), enabled: false, is_test: false});
+      known[id] = true;
+      added++;
+    });
+    if (added) {
+      await saveAndReload();
+    } else {
+      renderSettings();
+    }
+    showAlert("同步结果", "已同步 " + added + " 个新频道（默认未启用）");
   });
 }
 function renderFgTabs() {
@@ -177,20 +272,22 @@ function renderFgTabs() {
         del.type = "button";
         del.className = "fgctrl rowicon";
         del.dataset.kind = "fgDel";
-        del.textContent = "🗑";
+        del.innerHTML = SVG_TRASH;   // 与频道/群行内删除按钮同一白色垃圾桶图标
         del.title = "删除当前转发组";
         wrap.appendChild(del);
       }
     }
   });
-  const add = document.createElement("button");
-  add.type = "button";
-  add.className = "fgtab-add";
-  add.id = "btnAddFg";
-  add.disabled = list.length >= MAX_FG;
-  add.title = list.length >= MAX_FG ? ("最多 " + MAX_FG + " 个转发组") : "添加转发组（空组，按需勾选成员）";
-  add.textContent = "＋ 添加转发组";
-  wrap.appendChild(add);
+  // 达到上限(10)后直接不显示新增按钮，删除一个后自动恢复
+  if (list.length < MAX_FG) {
+    const add = document.createElement("button");
+    add.type = "button";
+    add.className = "fgtab-add";
+    add.id = "btnAddFg";
+    add.title = "添加转发组（空组，按需勾选成员）";
+    add.textContent = "＋ 添加转发组";
+    wrap.appendChild(add);
+  }
 }
 function addForwardingGroup() {
   const list = getFgList();
@@ -255,43 +352,62 @@ function renderSettings() {
   const activeFg = getActiveFg();
   const gb = document.getElementById("groupBody");
   gb.innerHTML = "";
-  settings.qq_group_openids.forEach((g, i) => {
+  // 只渲染当前转发组的成员；「启用/测试」仍是全局实体状态
+  const memberGrps = {};
+  if (activeFg) {
+    (activeFg.groups || []).forEach(function (o) { memberGrps[String(o)] = true; });
+  }
+  const grpRows = settings.qq_group_openids.filter(function (g) { return memberGrps[String(g.openid)]; });
+  if (!grpRows.length) {
+    gb.innerHTML = '<tr><td colspan="6" class="fgempty">（空）点击上方「从已注册项新增」从已发现/已注册的群中选择加入</td></tr>';
+  }
+  grpRows.forEach((g) => {
     const tr = document.createElement("tr");
+    const gi = settings.qq_group_openids.indexOf(g);
     // 名称/账号：注册审核通过时写入（无注册信息的手动条目为空），
     // 名称缺省时回退显示身份库自动识别的群名
     const gname = g.name || identityName("groups", g.openid) || "";
     const gacc = g.qq_id || "";
-    const inFgGroup = !!(activeFg && activeFg.groups.indexOf(String(g.openid)) >= 0);
     tr.innerHTML =
-      '<td style="text-align:center"><input type="checkbox" data-kind="fgGroup" data-i="' + i + '"' + (inFgGroup ? " checked" : "") + ' title="本组转发：勾选 = 该群参与当前转发组的路由；还必须同时处于「启用」状态才会接收转发。"></td>' +
-      '<td style="text-align:center"><input type="checkbox" data-kind="group" data-i="' + i + '"' + (g.enabled ? " checked" : "") + '></td>' +
-      '<td style="text-align:center"><input type="checkbox" data-kind="groupIsTest" data-i="' + i + '"' + (g.is_test ? " checked" : "") + '></td>' +
+      '<td style="text-align:center"><input type="checkbox" data-kind="group" data-i="' + gi + '"' + (g.enabled ? " checked" : "") + '></td>' +
+      '<td style="text-align:center"><input type="checkbox" data-kind="groupIsTest" data-i="' + gi + '"' + (g.is_test ? " checked" : "") + '></td>' +
       '<td>' +
         (gname ? '<div style="color:#8dc891;font-size:12px;word-break:break-all;">' + escapeHtml(gname) + '</div>' : '') +
       '</td>' +
       '<td style="font-size:12px;">' + escapeHtml(gacc) + '</td>' +
       '<td class="mono">' + escapeHtml(g.openid) + '</td>' +
-      '<td style="text-align:right"><button class="danger rowicon" data-kind="groupDel" data-i="' + i + '" title="删除群">' + SVG_TRASH + '</button></td>';
+      '<td style="text-align:right"><button class="danger rowicon" data-kind="fgGroupRemove" data-id="' + escapeHtml(String(g.openid)) + '" title="从当前转发组移除（不影响全局与其他组）">' + SVG_TRASH + '</button></td>';
     gb.appendChild(tr);
   });
   const cb = document.getElementById("chanBody");
   cb.innerHTML = "";
-  settings.discord_channels.forEach((c, i) => {
+  // 只渲染当前转发组的成员
+  const memberChans = {};
+  if (activeFg) {
+    (activeFg.channels || []).forEach(function (id) { memberChans[String(id)] = true; });
+  }
+  const chanRows = settings.discord_channels.filter(function (c) { return memberChans[String(c.id)]; });
+  if (!chanRows.length) {
+    cb.innerHTML = '<tr><td colspan="5" class="fgempty">（空）点击上方「从已注册项新增」从已发现/已注册的频道中选择加入</td></tr>';
+  }
+  chanRows.forEach((c) => {
     const tr = document.createElement("tr");
+    const gi = settings.discord_channels.indexOf(c);
     const realName = channelNames[c.id] || "";
-    const inFgChan = !!(activeFg && activeFg.channels.indexOf(String(c.id)) >= 0);
     tr.innerHTML =
-      '<td style="text-align:center"><input type="checkbox" data-kind="fgChan" data-i="' + i + '"' + (inFgChan ? " checked" : "") + ' title="本组转发：勾选 = 该频道参与当前转发组的路由；还必须同时处于「启用」状态才会转发。"></td>' +
-      '<td style="text-align:center"><input type="checkbox" data-kind="chan" data-i="' + i + '"' + (c.enabled ? " checked" : "") + '></td>' +
-      '<td style="text-align:center"><input type="checkbox" data-kind="chanIsTest" data-i="' + i + '"' + (c.is_test ? " checked" : "") + '></td>' +
+      '<td style="text-align:center"><input type="checkbox" data-kind="chan" data-i="' + gi + '"' + (c.enabled ? " checked" : "") + '></td>' +
+      '<td style="text-align:center"><input type="checkbox" data-kind="chanIsTest" data-i="' + gi + '"' + (c.is_test ? " checked" : "") + '></td>' +
       '<td>' +
-        '<input type="text" value="' + escapeHtml(c.name || "") + '" data-kind="chanName" data-i="' + i + '">' +
+        '<span class="chan-name" data-kind="chanNameDisplay" data-i="' + gi + '">' +
+          '<span class="chan-name-text">' + escapeHtml(c.name || "") + '</span>' +
+          '<span class="chan-name-edit" data-kind="chanNameEdit" data-i="' + gi + '" title="编辑频道名称">✎</span>' +
+        '</span>' +
         (realName ? '<div style="color:#8dc891;font-size:12px;margin-top:2px;">' + escapeHtml(realName) + '</div>' : '') +
       '</td>' +
       '<td class="mono">' + escapeHtml(c.id) + '</td>' +
       '<td><div style="display:flex;gap:4px;justify-content:flex-end;">' +
-        '<button class="sec rowicon' + ((c.filter_usernames && c.filter_usernames.length) || (c.filter_keywords && c.filter_keywords.length) ? ' filter-active' : '') + '" data-kind="chanFilter" data-i="' + i + '" title="消息筛选">' + SVG_FUNNEL + '</button>' +
-        '<button class="danger rowicon" data-kind="chanDel" data-i="' + i + '" title="删除频道">' + SVG_TRASH + '</button>' +
+        '<button class="sec rowicon' + ((c.filter_usernames && c.filter_usernames.length) || (c.filter_keywords && c.filter_keywords.length) ? ' filter-active' : '') + '" data-kind="chanFilter" data-i="' + gi + '" title="消息筛选">' + SVG_FUNNEL + '</button>' +
+        '<button class="danger rowicon" data-kind="fgChanRemove" data-id="' + escapeHtml(String(c.id)) + '" title="从当前转发组移除（不影响全局与其他组）">' + SVG_TRASH + '</button>' +
       '</div></td>';
     cb.appendChild(tr);
   });
@@ -320,25 +436,29 @@ function renderSettings() {
   if (bfEnabled) bfEnabled.checked = settings.backfill_enabled !== false;
   const bfLimit = document.getElementById("backfillLimit");
   if (bfLimit) bfLimit.value = Number(settings.backfill_limit) > 0 ? settings.backfill_limit : 10;
-  // 表头全选框状态：全部勾选→勾选，全部取消→取消，部分→半选
-  syncHeaderAll("groupAllEnabled", settings.qq_group_openids || [], "enabled");
-  syncHeaderAll("groupAllTest", settings.qq_group_openids || [], "is_test");
-  syncHeaderAll("chanAllEnabled", settings.discord_channels || [], "enabled");
-  syncHeaderAll("chanAllTest", settings.discord_channels || [], "is_test");
+  // 表头全选框状态仅反映「当前转发组」实际显示的成员（而非全部全局实体），
+  // 避免隐藏的非本组成员导致半选误判：全部→勾选，全不→取消，部分→半选，无成员→两者均 false
+  syncHeaderAll("groupAllEnabled", grpRows, "enabled");
+  syncHeaderAll("groupAllTest", grpRows, "is_test");
+  syncHeaderAll("chanAllEnabled", chanRows, "enabled");
+  syncHeaderAll("chanAllTest", chanRows, "is_test");
   syncHeaderAll("userAllEnabled", settings.qq_user_openids || [], "enabled");
 }
 
 function syncHeaderAll(id, items, field) {
   const el = document.getElementById(id);
   if (!el) return;
-  if (!items.length) {
+  const on = items.filter(function (o) { return !!o[field]; }).length;
+  if (on === 0) {
     el.checked = false;
     el.indeterminate = false;
-    return;
+  } else if (on === items.length) {
+    el.checked = true;
+    el.indeterminate = false;
+  } else {
+    el.checked = false;
+    el.indeterminate = true;
   }
-  const on = items.filter(function (o) { return o[field]; }).length;
-  el.checked = on === items.length;
-  el.indeterminate = on > 0 && on < items.length;
 }
 
 function escapeHtml(s) {
@@ -598,7 +718,7 @@ let addKind = null;
 
 const ADD_KINDS = {
   group: {
-    title: "新增 QQ 接收群",
+    title: "手动新增",
     idLabel: "Group OpenID",
     idPlaceholder: "群 OpenID",
     idRequiredMsg: "请填写群 openid",
@@ -606,7 +726,7 @@ const ADD_KINDS = {
     showRemark: true,
   },
   chan: {
-    title: "新增 Discord 频道",
+    title: "手动新增",
     idLabel: "Channel ID",
     idPlaceholder: "频道 ID",
     idRequiredMsg: "请填写频道 ID",
@@ -729,16 +849,45 @@ document.addEventListener("click", async function (e) {
     addForwardingGroup();
     return;
   }
-  if (k === "groupDel") {
-    const idx = Number(btn.dataset.i);
-    const g = settings.qq_group_openids[idx];
-    const label = (g.name || "").trim() || (g.remark || "").trim() || identityName("groups", g.openid) || g.openid;
-    const delId = g.openid;
-    showConfirmDlg("删除群", "确定要删除群「" + label + "」吗？", async function () {
-      settings.qq_group_openids.splice(idx, 1);
-      purgeFgMember(delId, "groups");   // 同步清理所有转发组引用
-      await saveAndReload();
-    }, "删除");
+  if (btn.id === "btnAddFgChan") {
+    openFgAddChooser("chan");
+    return;
+  }
+  if (btn.id === "btnAddFgGroup") {
+    openFgAddChooser("group");
+    return;
+  }
+  if (btn.id === "fgAddPick") {
+    hideFgAddChooser();
+    openFgAddPicker(fgAddKind);
+    return;
+  }
+  if (btn.id === "fgAddScan") {
+    // 不立即关闭二级窗口：先进入处理中状态（按钮禁用+半透明），
+    // 等 /api/channels/refresh 完成后再关闭窗口并继续原有后续流程；
+    // 失败时恢复可用并显示现有错误提示。
+    if (btn.disabled) return;        // 处理中：防重复触发
+    setFgAddModalBusy(true);
+    try {
+      await scanReadableChannels(null);
+    } finally {
+      setFgAddModalBusy(false);
+      hideFgAddChooser();
+    }
+    return;
+  }
+  if (btn.id === "fgAddManual") {
+    hideFgAddChooser();
+    openAddModal(fgAddKind);
+    return;
+  }
+  if (btn.id === "fgAddCancel") {
+    hideFgAddChooser();
+    return;
+  }
+  if (k === "fgGroupRemove") {
+    removeFgMember(btn.dataset.id, "groups");
+    return;
   } else if (k === "userDel") {
     const idx = Number(btn.dataset.i);
     const u = settings.qq_user_openids[idx];
@@ -749,19 +898,8 @@ document.addEventListener("click", async function (e) {
     }, "删除");
   } else if (k === "chanFilter") {
     openFilterModal(Number(btn.dataset.i));
-  } else if (k === "chanDel") {
-    const idx = Number(btn.dataset.i);
-    const name = settings.discord_channels[idx].name || settings.discord_channels[idx].id;
-    const delId = settings.discord_channels[idx].id;
-    showConfirmDlg("删除频道", "确定要删除频道「" + name + "」吗？", async function () {
-      settings.discord_channels.splice(idx, 1);
-      purgeFgMember(delId, "channels");   // 同步清理所有转发组引用
-      await saveAndReload();
-    }, "删除");
-  } else if (btn.id === "btnAddGroup") {
-    openAddModal("group");
-  } else if (btn.id === "btnAddChan") {
-    openAddModal("chan");
+  } else if (k === "fgChanRemove") {
+    removeFgMember(btn.dataset.id, "channels");
   } else if (btn.id === "btnAddUser") {
     openAddModal("user");
   } else if (btn.id === "btnSync") {
@@ -779,38 +917,6 @@ document.addEventListener("click", async function (e) {
     await refreshStatus();
   } else if (btn.id === "btnDiscordDev") {
     window.open("https://discord.com/developers/home", "_blank");
-  } else if (btn.id === "btnSyncChannels") {
-    // 扫描 Bot 可读取内容的频道，弹窗勾选后再加入转发列表（默认未启用）
-    btn.disabled = true;
-    let r;
-    try {
-      r = await jpost("/api/channels/refresh");
-    } finally {
-      btn.disabled = false;
-    }
-    if (!r.ok) { showAlert("扫描失败", r.msg || "扫描失败"); return; }
-    const list = (r.audit && r.audit.readable) || [];
-    const known = {};
-    settings.discord_channels.forEach(function (c) { known[String(c.id)] = true; });
-    const pending = list.filter(function (ch) { return !known[String(ch.id)]; });
-    if (!pending.length) { showAlert("同步结果", "没有发现新频道"); return; }
-    showConfirmSelect("勾选要添加的新频道（共 " + pending.length + " 个）", pending, function (ch) { return ch.name + " (" + ch.id + ")"; }, async function (selected) {
-      if (!selected.length) { showAlert("同步结果", "未选择任何频道"); return; }
-      let added = 0;
-      selected.forEach(function (ch) {
-        const id = String(ch.id);
-        if (known[id]) return;
-        settings.discord_channels.push({id: id, name: String(ch.name || "").replace(/^#/, ""), enabled: false, is_test: false});
-        known[id] = true;
-        added++;
-      });
-      if (added) {
-        await saveAndReload();
-      } else {
-        renderSettings();
-      }
-      showAlert("同步结果", "已同步 " + added + " 个新频道（默认未启用）");
-    });
   } else if (btn.id === "btnClearLog") {
     const r = await jpost("/api/bot/log/clear");
     if (!r.ok) showAlert("清空失败", r.msg || "清空失败");
@@ -932,20 +1038,6 @@ document.addEventListener("change", async function (e) {
     return;
   }
   if (!el.dataset.kind) return;
-  if (el.dataset.kind === "fgChan") {
-    const idx = Number(el.dataset.i);
-    const c = settings.discord_channels[idx];
-    if (c) toggleFgMember(getActiveFg(), c.id, "channels", el.checked);
-    await saveAndReload();
-    return;
-  }
-  if (el.dataset.kind === "fgGroup") {
-    const idx = Number(el.dataset.i);
-    const g = settings.qq_group_openids[idx];
-    if (g) toggleFgMember(getActiveFg(), g.openid, "groups", el.checked);
-    await saveAndReload();
-    return;
-  }
   if (el.dataset.kind === "group") {
     settings.qq_group_openids[Number(el.dataset.i)].enabled = el.checked;
     await saveAndReload();
@@ -971,6 +1063,29 @@ document.addEventListener("blur", async function (e) {
     await saveAndReload();
   }
 }, true);
+
+// 频道名称：正常状态显示「名称 ✎」，点击 ✎ 才显示输入框进入编辑；
+// 失焦后沿用上方既有 chanName 保存逻辑（保存并重渲染，自动恢复为「名称 ✎」）。
+function startChanNameEdit(i) {
+  const c = settings.discord_channels[Number(i)];
+  if (!c) return;
+  const holder = document.querySelector('.chan-name[data-kind="chanNameDisplay"][data-i="' + i + '"]');
+  if (!holder) return;
+  const input = document.createElement("input");
+  input.type = "text";
+  input.value = c.name || "";
+  input.dataset.kind = "chanName";
+  input.dataset.i = String(i);
+  holder.replaceWith(input);
+  input.focus();
+  input.select();
+}
+document.addEventListener("click", function (e) {
+  const edit = e.target.closest('[data-kind="chanNameEdit"]');
+  if (edit) {
+    startChanNameEdit(edit.dataset.i);
+  }
+});
 
 function sleep(ms) { return new Promise(function (r) { setTimeout(r, ms); }); }
 

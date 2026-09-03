@@ -111,20 +111,26 @@
     font-size: 12px; line-height: 1;
     display: inline-flex; align-items: center; justify-content: center;
   }
-  .fg-note {
-    color: #8b93a1; font-size: 12px; margin: 0 0 12px;
-    padding: 8px 10px; background: #232833; border-left: 3px solid #5865F2;
-    border-radius: 4px;
-  }
   .fgsection { border-top: 1px solid #2a3140; padding-top: 12px; }
   .fgsection h3 { font-size: 14px; margin: 0 0 10px; color: #aeb6ff; }
+  /* Discord 转发频道 / QQ 接收群 作为「转发组」的二级标题：字号更小、层级低于转发组 */
+  .fgsection h3.fgh3 { font-size: 13px; color: #9aa3e0; font-weight: normal; }
+  /* 频道名称：正常状态只显示「名称 ✎」，✎ 为普通文本标记（非按钮），点击后进入编辑 */
+  .chan-name {
+    display: inline-flex; align-items: center; gap: 6px;
+    padding: 6px 0; color: #e6e8eb; min-height: 30px;
+  }
+  .chan-name .chan-name-text { word-break: break-all; }
+  .chan-name .chan-name-edit {
+    color: #8b93a1; cursor: pointer; font-size: 13px; user-select: none; flex: none;
+  }
+  .chan-name .chan-name-edit:hover { color: #fff; }
   .tablewrap { overflow-x: auto; }
   .tablewrap table { min-width: 540px; }
-  /* 两层语义区分：「本组转发」为主列、「启用」为模式允许列 */
-  th.col-main { color: #4fd1c5; }
+  /* 「启用」表头弱化 */
   th.col-muted { color: #8b93a1; }
-  .colhint { display: block; color: #5a6270; font-size: 11px; font-weight: normal; }
-  th.col-main .colhint { color: #3d8f88; }
+  /* 空成员占位提示 */
+  td.fgempty { color: #5a6270; text-align: center; padding: 14px 8px; }
   @media (max-width: 720px) {
     .fgtab { padding: 5px 10px; font-size: 12px; }
   }

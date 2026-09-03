@@ -41,23 +41,25 @@
   </div>
 
   <div class="card">
-    <h2 style="display:flex;justify-content:space-between;align-items:center;"><span style="display:flex;align-items:center;gap:6px;">转发组 <button class="hintbtn" data-hint="hint-fg" data-title="转发组">?</button></span> <button class="foldbtn" data-fold="fgBody">▾</button></h2>
+    <h2 style="display:flex;align-items:center;gap:6px;">转发组 <button class="hintbtn" data-hint="hint-fg" data-title="转发组">?</button></h2>
     <div id="fgBody">
       <div class="fgtabs" id="fgTabs">
         <!-- 转发组 tab 由 app.js 动态渲染（步骤3），当前组加 .active；此处仅占位展示结构 -->
         <button type="button" class="fgtab active" data-kind="fgTab" data-id="default">转发组1</button>
         <button type="button" class="fgtab-add" id="btnAddFg" title="添加转发组">＋ 添加转发组</button>
       </div>
-      <div class="fg-note">转发组决定频道发送到哪些 QQ 群；频道和群还必须处于当前模式「启用」状态（下方「启用」列）。</div>
-      <div class="hint" id="hint-fg" style="display:none">一个转发组 = 一组"频道 → 群"路由关系：「本组转发」勾选 = 该频道/群参与当前转发组的路由；「启用」= 当前模式（转发/测试/自定义）是否允许该频道/群转发，两者同时满足才会发送。频道/群可同时属于多个转发组。</div>
+      <div class="hint" id="hint-fg" style="display:none">一个转发组 = 一组"频道 → 群"成员列表：加入本组的频道只转发给本组的群。「＋ 新增」提供多种方式：从全部可读频道、已注册实体中选择加入本组，或手动新增（自动加入本组）；行内"删除"仅把实体移出当前转发组，不影响全局与其他组。「启用」= 当前模式（转发/测试/自定义）是否允许转发，两者同时满足才发送。频道/群可同时属于多个转发组，各转发组配置互相独立。
+
+· Discord 转发频道：列表只显示当前转发组的频道成员。「＋ 新增」可从全部可读频道、已注册频道中选择加入本组，或手动新增（自动加入本组）；扫描发现的新频道仅登记、不自动入组。行内"删除"仅从本组移除，不删除全局频道。勾选「启用」= 模式放行（全局）。
+
+· QQ 接收群：列表只显示当前转发组的群成员。「＋ 新增」可从已注册群中选择加入本组，或手动新增（自动加入本组）；「注册审核」通过的新群不自动入组。行内"删除"仅从本组移除，不删除全局群。群成员在群里发送"注册群 群号 群名称"申请接入（须为白名单用户），点"注册审核"处理。</div>
 
       <div class="fgsection">
-        <h3 style="display:flex;justify-content:space-between;align-items:center;"><span style="display:flex;align-items:center;gap:6px;">Discord 转发频道 <button class="hintbtn" data-hint="hint-chan" data-title="Discord 转发频道">?</button></span> <button class="foldbtn" data-fold="chanList">▾</button></h3>
+        <h3 class="fgh3" style="display:flex;justify-content:space-between;align-items:center;"><span>Discord 转发频道</span> <button class="foldbtn" data-fold="chanList">▾</button></h3>
         <div class="tablewrap">
           <table id="chanList" style="table-layout:fixed">
             <thead><tr>
-              <th style="width:64px;text-align:center" class="col-main" title="勾选 = 该频道参与当前转发组的路由">本组转发<span class="colhint">当前组路由</span></th>
-              <th style="width:64px;text-align:center" class="col-muted" title="启用 = 当前模式是否允许该频道转发">启用<span class="colhint">模式允许</span><br><input type="checkbox" id="chanAllEnabled"></th>
+              <th style="width:64px;text-align:center" class="col-muted" title="启用 = 当前模式是否允许该频道转发">启用<br><input type="checkbox" id="chanAllEnabled"></th>
               <th style="width:64px;text-align:center">测试<br><input type="checkbox" id="chanAllTest"></th>
               <th>频道名称</th><th style="width:29.1%">频道 ID</th><th style="width:76px"></th>
             </tr></thead>
@@ -65,32 +67,28 @@
           </table>
         </div>
         <div class="row addrow">
-          <button id="btnAddChan">＋ 新增</button>
-          <button id="btnSyncChannels" class="sec">同步可读频道</button>
+          <button id="btnAddFgChan">＋ 新增</button>
           <button id="btnDiscordDev" class="sec" style="margin-left:auto">Discord开发者门户</button>
         </div>
-        <div class="hint" id="hint-chan" style="display:none">「启用」= 模式放行；「本组转发」= 参与当前转发组的路由，两者同时满足才转发。点"同步可读频道"可自动加入 Bot 有读取权限的频道（默认不启用、不入任何转发组）。</div>
       </div>
 
       <div class="fgsection">
-        <h3 style="display:flex;justify-content:space-between;align-items:center;"><span style="display:flex;align-items:center;gap:6px;">QQ 接收群 <button class="hintbtn" data-hint="hint-group" data-title="QQ 接收群">?</button></span> <button class="foldbtn" data-fold="groupList">▾</button></h3>
+        <h3 class="fgh3" style="display:flex;justify-content:space-between;align-items:center;"><span>QQ 接收群</span> <button class="foldbtn" data-fold="groupList">▾</button></h3>
         <div class="tablewrap">
           <table id="groupList" style="table-layout:fixed">
             <thead><tr>
-              <th style="width:64px;text-align:center" class="col-main" title="勾选 = 该群接收当前转发组的路由转发">本组转发<span class="colhint">当前组路由</span></th>
-              <th style="width:64px;text-align:center" class="col-muted" title="启用 = 当前模式是否允许该群接收转发">启用<span class="colhint">模式允许</span><br><input type="checkbox" id="groupAllEnabled"></th>
+              <th style="width:64px;text-align:center" class="col-muted" title="启用 = 当前模式是否允许该群接收转发">启用<br><input type="checkbox" id="groupAllEnabled"></th>
               <th style="width:64px;text-align:center">测试<br><input type="checkbox" id="groupAllTest"></th>
-              <th>名称</th><th style="width:16%">账号</th><th style="width:28%">Group OpenID</th><th style="width:64px"></th>
+              <th>名称</th><th style="width:18%">账号</th><th style="width:30%">Group OpenID</th><th style="width:64px"></th>
             </tr></thead>
             <tbody id="groupBody"></tbody>
           </table>
         </div>
         <div class="row addrow">
-          <button id="btnAddGroup">＋ 新增</button>
+          <button id="btnAddFgGroup">＋ 新增</button>
           <button id="btnSync" class="sec">注册审核</button>
           <button id="btnQQPlatform" class="sec" style="margin-left:auto">QQ 开放平台管理页</button>
         </div>
-        <div class="hint" id="hint-group" style="display:none">「启用」= 模式放行；「本组转发」= 参与当前转发组的路由，两者同时满足才接收。群成员在群里发送"注册群 群号 群名称"申请接入（须为白名单用户），点"注册审核"处理。</div>
       </div>
     </div>
   </div>
@@ -194,6 +192,19 @@
     <div style="display:flex;gap:10px;justify-content:flex-end;margin-top:14px;">
       <button id="filterSave">保存</button>
       <button id="filterCancel" class="sec">取消</button>
+    </div>
+  </div>
+</div>
+<div id="fgAddModal" style="display:none;position:fixed;inset:0;background:rgba(0,0,0,.55);z-index:999;align-items:center;justify-content:center;">
+  <div style="background:#1e2330;border:1px solid #3a4150;border-radius:10px;padding:18px;max-width:440px;width:90%;display:flex;flex-direction:column;">
+    <h3 id="fgAddTitle" style="margin:0 0 12px;">新增频道</h3>
+    <div style="display:flex;flex-direction:column;gap:10px;">
+      <button type="button" id="fgAddScan">从全部可读频道新增</button>
+      <button type="button" id="fgAddPick">从已注册项新增</button>
+      <button type="button" id="fgAddManual" class="sec">手动新增</button>
+    </div>
+    <div style="display:flex;gap:10px;justify-content:flex-end;margin-top:14px;">
+      <button id="fgAddCancel" class="sec">取消</button>
     </div>
   </div>
 </div>
