@@ -117,17 +117,25 @@ def apply_success(
     ok_map: dict[str, bool],
     message_id: str,
 ) -> bool:
-    """只把 ok=True 的群 last_id 推进到 message_id。
+    """只把 ok=True 的群 last_id 推进到 message_id，且只进不退：
+    群已有更高游标（如延迟重试期间收到了更新的消息）时不回退，
+    避免把补发 base 拉低造成已送达消息被重复发送。
 
     返回是否产生任一变更：
     - ok_map 为空（QQ 未连接等场景）→ 返回 False，调用方不写盘
-    - ok=False 的群保持旧记录，下次补发时只重试失败群
+    - ok=False 的群保持旧记录，由延迟重试/补发负责补送
     """
 
     changed = False
 
     for group, ok in ok_map.items():
-        if ok:
+        if not ok:
+            continue
+        current = channel_map.get(group) or channel_map.get("*")
+        if (
+            current is None
+            or int(message_id) > int(current)
+        ):
             channel_map[group] = message_id
             changed = True
 

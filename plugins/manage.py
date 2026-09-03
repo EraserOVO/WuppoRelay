@@ -9,7 +9,10 @@ from nonebot import get_driver
 from nonebot.adapters import Bot, Event
 
 from nonebot.adapters.qq import Bot as QQBot
-from nonebot.adapters.qq.event import C2CMessageCreateEvent
+from nonebot.adapters.qq.event import (
+    C2CMessageCreateEvent,
+    GroupMessageCreateEvent,
+)
 
 from plugins.config import get_active_user_openids
 from plugins.json_io import (
@@ -152,10 +155,16 @@ def _help_text():
         "channels 频道列表\n"
         "users 权限列表\n"
         "backfill 补发状态\n"
-        "backfill <on/off/run/clear/refresh> 开/关/触发/清除/刷新\n"
-        "register <QQ号> <昵称> 用户私聊提交注册申请\n"
-        "register-group <群号> <群名称> 群内提交群注册申请（白名单用户）\n"
+        "backfill <on/off/run/clear/refresh> 开/关/触发/清空/刷新\n"
+        "register {QQ号} {昵称} 用户私聊提交注册申请\n"
         "list 查看命令清单"
+    )
+
+
+def _group_help_text():
+    return (
+        "【群聊命令】\n"
+        "register-group {群号} {群名称} 群内提交群注册申请"
     )
 
 
@@ -216,11 +225,11 @@ async def _cmd_mode(args):
 async def _cmd_list(kind):
     """查询群/频道/用户列表（复用面板 /api/settings 的配置与 getter）"""
     if kind == "qq_group_openids":
-        title, id_key, desc_key = "群列表", "openid", "remark"
+        title, id_key, desc_key = "群列表", "openid", "name"
     elif kind == "discord_channels":
         title, id_key, desc_key = "频道列表", "id", "name"
     else:
-        title, id_key, desc_key = "权限列表", "openid", "remark"
+        title, id_key, desc_key = "权限列表", "openid", "name"
 
     settings = await _panel_get("/api/settings")
     items = settings.get(kind) or []
@@ -232,6 +241,9 @@ async def _cmd_list(kind):
             continue
         flag = "（启用）" if item.get("enabled") else "（未启用）"
         desc = str(item.get(desc_key) or "").strip()
+        if not desc:
+            # 群/用户条目未注册时无 name，回退显示原 remark（如"自动发现，点击启用"）
+            desc = str(item.get("remark") or "").strip()
         ident = str(item.get(id_key) or "?")
         text = flag + (desc + " " if desc else "") + ident
         if item.get("is_test"):
@@ -306,13 +318,13 @@ async def _cmd_backfill(args):
             cleared = data.get("cleared", 0)
             # 记录都已推进到最新，无待清除内容
             if not cleared:
-                return "当前无可清除的待补发"
+                return "当前无可清空的待补发"
             return (
-                "已清除待补发（"
+                "已清空待补发（"
                 + str(cleared)
                 + " 个频道记录推进到最新）"
             )
-        return data.get("msg") or "清除失败"
+        return data.get("msg") or "清空失败"
 
     if arg == "refresh":
         # 立即读取一次 Discord 实时状态（各频道待补发缺口）
@@ -373,6 +385,22 @@ async def handle(
         bot,
         QQBot
     ):
+        return
+
+    # 群聊仅支持 list（查看群聊命令清单，不做白名单校验）；
+    # 其余群消息保持静默，register-group 由 plugins/registration.py 处理
+    if isinstance(
+        event,
+        GroupMessageCreateEvent
+    ):
+        message = event.get_plaintext().strip()
+
+        if message == "list":
+            await bot.send(
+                event,
+                _group_help_text()
+            )
+
         return
 
     if not isinstance(

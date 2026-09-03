@@ -13,14 +13,18 @@ from plugins.config import (
 from plugins.filter import check_message_filter
 from plugins.history import (
     load_last_messages,
-    save_last_messages,
+    update_last_messages,
 )
 from plugins.fetch import (
     normalize_event,
     build_parts,
 )
-from plugins.sender import send_relay_message
+from plugins.sender import log_partial_failure
 from plugins.stats import record
+from plugins.retry import (
+    send_and_record,
+    schedule_retry,
+)
 from plugins.dedup import (
     normalize_channel_map,
     select_target_groups,
@@ -121,12 +125,13 @@ async def handle(
             author_username,
         )
 
-        apply_success(
-            channel_map,
-            {g: True for g in target_groups},
-            message_id,
+        await update_last_messages(
+            lambda last: apply_success(
+                normalize_channel_map(last, channel_id),
+                {g: True for g in target_groups},
+                message_id,
+            )
         )
-        save_last_messages(last_messages)
 
         return
 
@@ -145,16 +150,25 @@ async def handle(
         return
 
 
-    ok_map = await send_relay_message(
+    ok_map = await send_and_record(
+        channel_id,
+        message_id,
         text_parts,
         media_items,
-        target_groups
+        target_groups,
     )
 
 
     if not ok_map:
         # QQ Bot 未连接：本次消息未发送、不记录去重ID
         return
+
+    # 多群部分失败时明确列出失败群（全成功/全失败由后续日志负责）
+    log_partial_failure(
+        ok_map,
+        channel_id,
+        message_id,
+    )
 
 
     if any(ok_map.values()):
@@ -163,17 +177,25 @@ async def handle(
         record(False)
 
 
-    # 只给发送成功的群记录去重 ID（失败的群保留旧记录，
-    # 重连补发时只补失败的群，已成功的群不会收到重复消息）
-    if apply_success(
-        channel_map,
-        ok_map,
-        message_id,
-    ):
+    failed_groups = [
+        group
+        for group, ok in ok_map.items()
+        if not ok
+    ]
 
-        save_last_messages(
-            last_messages
+    if failed_groups:
+        # 只登记失败群延迟重试（已成功的群不受影响）；
+        # 若失败群其实正在被补发/重试其他路径送达，purge 会清掉欠账
+        schedule_retry(
+            channel_id,
+            message_id,
+            message,
+            failed_groups,
+            source_label="自动转发来自",
         )
+
+
+    if any(ok_map.values()):
 
         logger.info(
             "记录Discord消息: {} {}",
@@ -184,7 +206,7 @@ async def handle(
     else:
 
         logger.warning(
-            "Discord消息发送失败，不记录去重ID（重连补发时会重试）: {} {}",
+            "Discord消息发送失败，不记录去重ID（延迟重试/重连补发会处理）: {} {}",
             channel_id,
             message_id
         )

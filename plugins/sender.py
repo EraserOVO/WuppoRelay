@@ -84,9 +84,9 @@ def _retry_after(exc, fallback):
     return fallback
 
 
-async def _send_with_retry(qq_bot, group_openid, message):
+async def _send_with_retry(qq_bot, group_openid, message, channel_id="", message_id=""):
     """发送一条消息，失败按指数退避重试（429/限流等待更长）；
-    返回是否成功"""
+    返回是否成功；失败日志附带 channel_id/message_id 便于定位原 Discord 消息"""
     delay = RETRY_DELAY
     rate_limited = False
     last_error = None
@@ -110,8 +110,10 @@ async def _send_with_retry(qq_bot, group_openid, message):
             last_error = exc
 
             logger.warning(
-                "发送失败(第{}次): {} {}",
+                "发送失败(第{}次) 频道{} 消息{} 群{}: {}",
                 attempt,
+                channel_id or "-",
+                message_id or "-",
                 group_openid,
                 exc
             )
@@ -136,9 +138,11 @@ async def _send_with_retry(qq_bot, group_openid, message):
 
     # 全部尝试失败：error 级别汇总，面板日志中更醒目
     logger.error(
-        "发送失败已达上限({}次){}: {} {}",
+        "发送失败已达上限({}次){} 频道{} 消息{} 群{}: {}",
         MAX_SEND_ATTEMPTS,
         "（限流）" if rate_limited else "（非限流）",
+        channel_id or "-",
+        message_id or "-",
         group_openid,
         last_error
     )
@@ -174,15 +178,24 @@ def split_long_text(text, limit=TEXT_CHUNK_LENGTH):
     return chunks
 
 
-async def _send_to_groups(qq_bot, groups, message):
+async def _send_to_groups(qq_bot, groups, message, channel_id="", message_id=""):
     """把同一条消息并行发到多个群；返回 {group_openid: 是否成功}"""
     results = await asyncio.gather(
-        *(_send_with_retry(qq_bot, group, message) for group in groups)
+        *(
+            _send_with_retry(
+                qq_bot,
+                group,
+                message,
+                channel_id=channel_id,
+                message_id=message_id,
+            )
+            for group in groups
+        )
     )
     return dict(zip(groups, results))
 
 
-async def send_text_parts(qq_bot, groups, text_parts):
+async def send_text_parts(qq_bot, groups, text_parts, channel_id="", message_id=""):
     """发送文字到指定群；超长文本按 TEXT_CHUNK_LENGTH 分片；
     返回 {group_openid: 是否全部送达}"""
     ok_map = {group: True for group in groups}
@@ -205,7 +218,13 @@ async def send_text_parts(qq_bot, groups, text_parts):
 
         message = QQMessage([make_text(chunk)])
 
-        results = await _send_to_groups(qq_bot, groups, message)
+        results = await _send_to_groups(
+            qq_bot,
+            groups,
+            message,
+            channel_id=channel_id,
+            message_id=message_id,
+        )
 
         for group, ok in results.items():
             if not ok:
@@ -214,7 +233,7 @@ async def send_text_parts(qq_bot, groups, text_parts):
     return ok_map
 
 
-async def send_media_items(qq_bot, groups, media_items):
+async def send_media_items(qq_bot, groups, media_items, channel_id="", message_id=""):
     """发送媒体到指定群；返回 {group_openid: 是否送达}
     媒体上传重试后仍失败时，降级为文字 + 原链接（该降级视为已送达）；
     只有降级也失败才记为失败。"""
@@ -224,7 +243,13 @@ async def send_media_items(qq_bot, groups, media_items):
 
         message = QQMessage([item["segment"]])
 
-        results = await _send_to_groups(qq_bot, groups, message)
+        results = await _send_to_groups(
+            qq_bot,
+            groups,
+            message,
+            channel_id=channel_id,
+            message_id=message_id,
+        )
 
         pending = [group for group, ok in results.items() if not ok]
 
@@ -233,8 +258,11 @@ async def send_media_items(qq_bot, groups, media_items):
 
         # 重试后仍失败：降级为链接
         logger.warning(
-            "富媒体上传失败，降级为链接: {}",
-            item["kind"]
+            "富媒体上传失败，降级为链接: {} 频道{} 消息{} 失败群{}",
+            item["kind"],
+            channel_id or "-",
+            message_id or "-",
+            pending
         )
 
         link_message = QQMessage(
@@ -244,7 +272,13 @@ async def send_media_items(qq_bot, groups, media_items):
             )]
         )
 
-        deg_results = await _send_to_groups(qq_bot, pending, link_message)
+        deg_results = await _send_to_groups(
+            qq_bot,
+            pending,
+            link_message,
+            channel_id=channel_id,
+            message_id=message_id,
+        )
 
         for group, ok in deg_results.items():
             if not ok:
@@ -253,7 +287,7 @@ async def send_media_items(qq_bot, groups, media_items):
     return ok_map
 
 
-async def send_relay_message(text_parts, media_items, groups=None):
+async def send_relay_message(text_parts, media_items, groups=None, channel_id="", message_id=""):
     """发送文字 + 媒体到指定群（默认全部启用群）；
     返回 {group_openid: 是否全部送达}；QQ Bot 未连接返回空 dict"""
     qq_bot = get_qq_bot()
@@ -279,7 +313,9 @@ async def send_relay_message(text_parts, media_items, groups=None):
         text_ok = await send_text_parts(
             qq_bot,
             groups,
-            text_parts
+            text_parts,
+            channel_id=channel_id,
+            message_id=message_id,
         )
 
         for group, ok in text_ok.items():
@@ -288,10 +324,25 @@ async def send_relay_message(text_parts, media_items, groups=None):
     media_ok = await send_media_items(
         qq_bot,
         groups,
-        media_items
+        media_items,
+        channel_id=channel_id,
+        message_id=message_id,
     )
 
     for group, ok in media_ok.items():
         ok_map[group] = ok_map[group] and ok
 
     return ok_map
+
+
+def log_partial_failure(ok_map, channel_id="", message_id=""):
+    """多群部分失败时汇总打印失败群列表（全成功/全失败不打印，
+    全失败由调用方原有的失败日志负责，避免重复告警）"""
+    failed = [group for group, ok in ok_map.items() if not ok]
+    if failed and len(failed) < len(ok_map):
+        logger.warning(
+            "部分群发送失败: 频道{} 消息{} 失败群: {}",
+            channel_id or "-",
+            message_id or "-",
+            failed
+        )

@@ -16,14 +16,18 @@ from plugins.config import (
 from plugins.filter import check_message_filter
 from plugins.history import (
     load_last_messages,
-    save_last_messages,
+    update_last_messages,
 )
 from plugins.fetch import (
     build_parts,
     fetch_channel_latest,
     fetch_channel_messages_after,
 )
-from plugins.sender import send_relay_message
+from plugins.sender import log_partial_failure
+from plugins.retry import (
+    send_and_record,
+    schedule_retry,
+)
 from plugins.stats import record
 from plugins.dedup import (
     normalize_channel_map,
@@ -144,14 +148,12 @@ async def _backfill_channel(channel_id, channel_name, active_groups, limit):
 
         if latest:
 
-            apply_baseline(
-                channel_map,
-                active_groups,
-                latest,
-            )
-
-            save_last_messages(
-                last_messages
+            await update_last_messages(
+                lambda last: apply_baseline(
+                    normalize_channel_map(last, channel_id),
+                    active_groups,
+                    latest,
+                )
             )
 
             logger.info(
@@ -221,12 +223,13 @@ async def _backfill_channel(channel_id, channel_name, active_groups, limit):
                 msg_author_username,
             )
 
-            apply_success(
-                channel_map,
-                {g: True for g in target_groups},
-                message_id,
+            await update_last_messages(
+                lambda last: apply_success(
+                    normalize_channel_map(last, channel_id),
+                    {g: True for g in target_groups},
+                    message_id,
+                )
             )
-            save_last_messages(last_messages)
 
             continue
 
@@ -240,10 +243,12 @@ async def _backfill_channel(channel_id, channel_name, active_groups, limit):
         if not has_content:
             continue
 
-        ok_map = await send_relay_message(
+        ok_map = await send_and_record(
+            channel_id,
+            message_id,
             text_parts,
             media_items,
-            target_groups
+            target_groups,
         )
 
         if not ok_map:
@@ -255,22 +260,35 @@ async def _backfill_channel(channel_id, channel_name, active_groups, limit):
             )
             return
 
+        # 多群部分失败时明确列出失败群（全成功/全失败由后续日志负责）
+        log_partial_failure(
+            ok_map,
+            channel_id,
+            message_id,
+        )
+
         if any(ok_map.values()):
             record(True)
         else:
             record(False)
 
-        # 只给发送成功的群记录去重 ID（失败的群保留旧记录，
-        # 下次连接补发时只会补失败的群）
-        if apply_success(
-            channel_map,
-            ok_map,
-            message_id,
-        ):
+        failed_groups = [
+            group
+            for group, ok in ok_map.items()
+            if not ok
+        ]
 
-            save_last_messages(
-                last_messages
+        if failed_groups:
+            # 补发中也失败：登记延迟重试（其他路径送达时 purge 会清欠账）
+            schedule_retry(
+                channel_id,
+                message_id,
+                msg,
+                failed_groups,
+                source_label="自动补发来自",
             )
+
+        if any(ok_map.values()):
 
             logger.info(
                 "启动补发: 记录Discord消息 {} {}",
@@ -281,7 +299,7 @@ async def _backfill_channel(channel_id, channel_name, active_groups, limit):
         else:
 
             logger.warning(
-                "启动补发: 发送失败，不记录去重ID: {} {}",
+                "启动补发: 发送失败，不记录去重ID（延迟重试/下次补发会处理）: {} {}",
                 channel_id,
                 message_id
             )

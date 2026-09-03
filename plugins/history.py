@@ -1,3 +1,4 @@
+import asyncio
 import os
 
 from plugins.json_io import (
@@ -68,3 +69,21 @@ def save_last_messages(data):
         _last_mtime, _last_size = st.st_mtime, st.st_size
     except OSError:
         pass
+
+
+_save_lock = asyncio.Lock()
+
+
+async def update_last_messages(mutate):
+    """并发安全的"应用变更并落盘"：锁内基于最新状态调用
+    mutate(最新 last_messages)（mutate 必须同步，不得在其中 await），
+    返回是否产生变更。
+
+    避免多任务各自持有旧副本互相覆盖推进；业务层锁，
+    不塞进通用 json_io.py。"""
+    async with _save_lock:
+        last_messages = load_last_messages()
+        changed = mutate(last_messages)
+        if changed:
+            save_last_messages(last_messages)
+        return changed
