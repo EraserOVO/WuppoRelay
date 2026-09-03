@@ -18,6 +18,13 @@ async function jpost(url, body) {
   return r.json();
 }
 
+// 运行日志自动跟随：仅当用户已在日志底部时新日志才滚到底部，向上翻阅时暂停，滚回底部自动恢复
+var logFollow = true;
+document.getElementById("log").addEventListener("scroll", function () {
+  const el = document.getElementById("log");
+  logFollow = el.scrollTop + el.clientHeight >= el.scrollHeight - 30;
+});
+
 function renderStatus(st) {
   const b = document.getElementById("badge");
   if (st.running) {
@@ -54,9 +61,10 @@ function renderStatus(st) {
   hint.textContent = st.running && !st.managed
     ? "检测到机器人可能由其他方式启动，本面板无法完全控制；如需接管请先手动停止。"
     : "";
-  document.getElementById("log").textContent = st.log || "（暂无日志）";
   const el = document.getElementById("log");
-  el.scrollTop = el.scrollHeight;
+  const stick = logFollow;
+  el.textContent = st.log || "（暂无日志）";
+  if (stick) el.scrollTop = el.scrollHeight;
   renderMode(st.mode);
   var autoEl = document.getElementById("chkAutostart");
   if (autoEl) autoEl.checked = !!st.autostart;
@@ -433,7 +441,7 @@ const ADD_KINDS = {
   group: {
     title: "新增 QQ 接收群",
     idLabel: "Group OpenID",
-    idPlaceholder: "粘贴群 openid（机器人在群里 @ 后可从日志/qq_group_openids.json 获取）",
+    idPlaceholder: "群 OpenID",
     idRequiredMsg: "请填写群 openid",
     showName: false,
     showRemark: true,
@@ -516,6 +524,11 @@ document.addEventListener("click", async function (e) {
     hideConfirm();
     return;
   }
+  if (btn.dataset.hint) {
+    const tip = document.getElementById(btn.dataset.hint);
+    showAlert(btn.dataset.title, (tip && tip.textContent) || "当前无附加说明。");
+    return;
+  }
   if (btn.dataset.fold) {
     const el = document.getElementById(btn.dataset.fold);
     const folded = el.style.display === "none";
@@ -572,7 +585,13 @@ document.addEventListener("click", async function (e) {
     window.open("https://discord.com/developers/home", "_blank");
   } else if (btn.id === "btnSyncChannels") {
     // 扫描 Bot 可读取内容的频道，弹窗勾选后再加入转发列表（默认未启用）
-    const r = await jpost("/api/channels/refresh");
+    btn.disabled = true;
+    let r;
+    try {
+      r = await jpost("/api/channels/refresh");
+    } finally {
+      btn.disabled = false;
+    }
     if (!r.ok) { showAlert("扫描失败", r.msg || "扫描失败"); return; }
     const list = (r.audit && r.audit.readable) || [];
     const known = {};
@@ -601,17 +620,39 @@ document.addEventListener("click", async function (e) {
     if (!r.ok) showAlert("清空失败", r.msg || "清空失败");
     await refreshStatus();
   } else if (btn.id === "btnBackfillRun") {
-    const r = await jpost("/api/backfill/run");
-    showAlert("补发", r.ok ? (r.msg || "补发已触发") : (r.msg || "补发失败"));
-    await refreshBackfill();
+    // 与 QQ 私聊 backfill run 一致：先查待补发缺口，无消息时直接告知，避免空触发
+    btn.disabled = true;
+    try {
+      const p = await jget("/api/backfill/pending");
+      if (p.ok && !p.total) {
+        showAlert("补发", "当前无可补发的消息");
+        await refreshBackfill();
+      } else {
+        const r = await jpost("/api/backfill/run");
+        showAlert("补发", r.ok ? (r.msg || "补发已触发") : (r.msg || "补发失败"));
+        await refreshBackfill();
+      }
+    } finally {
+      btn.disabled = false;
+    }
   } else if (btn.id === "btnBackfillRefresh") {
-    await refreshBackfill();
-    showAlert("刷新状态", "已读取 Discord 实时状态");
-  } else if (btn.id === "btnBackfillClear") {
-    showConfirmDlg("清除待补发", "清除待补发？未转发的旧消息将不再补发，此操作不可撤销。", async function () {
-      const r = await jpost("/api/backfill/clear");
-      showAlert("清除结果", r.ok ? ("已清除 " + (r.cleared || 0) + " 个频道的待补发") : (r.msg || "清除失败"));
+    btn.disabled = true;
+    try {
       await refreshBackfill();
+      showAlert("刷新状态", "已读取 Discord 实时状态");
+    } finally {
+      btn.disabled = false;
+    }
+  } else if (btn.id === "btnBackfillClear") {
+    showConfirmDlg("清空待补发", "清空待补发？未转发的旧消息将不再补发，此操作不可撤销。", async function () {
+      btn.disabled = true;
+      try {
+        const r = await jpost("/api/backfill/clear");
+        showAlert("清空结果", r.ok ? (r.cleared ? ("已清空 " + r.cleared + " 个频道的待补发") : "当前无可清空的待补发") : (r.msg || "清空失败"));
+        await refreshBackfill();
+      } finally {
+        btn.disabled = false;
+      }
     });
   } else if (btn.id === "btnStart") {
     await jpost("/api/bot/start");

@@ -65,6 +65,15 @@
     font-size: 14px; border: 1px solid #3a4250; border-radius: 5px;
   }
   .foldbtn:hover { color: #fff; border-color: #8b93a1; }
+  button.hintbtn {
+    width: 20px; height: 20px; padding: 0; border-radius: 50%;
+    background: transparent; color: #8b93a1; border: 1px solid #3a4250;
+    font-size: 12px; line-height: 18px; text-align: center;
+  }
+  button.hintbtn:hover { color: #fff; border-color: #8b93a1; }
+  /* 确认/提示弹窗永远在最上层（三个弹窗内联 z-index:999，同层时 addModal 因 DOM 靠后会盖住它） */
+  #confirmModal { z-index: 1000 !important; }
+  #chanBody input[data-kind="chanName"] { width: 25%; }
   button.rowicon {
     width: 28px; height: 28px; padding: 0;
     border-radius: 5px; font-size: 14px; line-height: 1;
