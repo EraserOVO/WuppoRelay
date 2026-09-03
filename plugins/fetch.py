@@ -52,6 +52,9 @@ FETCH_COLLECT_CAP = 1000
 RATE_LIMIT_ATTEMPTS = 3
 RATE_LIMIT_FALLBACK = 5.0
 
+# 回复引用行正文显示上限（防止被回复的长文刷屏）
+REFERENCE_TEXT_LIMIT = 50
+
 
 def _rate_limit_wait(response, fallback):
     """从 429 响应头取 Retry-After（秒）；缺失/非法时用 fallback"""
@@ -98,11 +101,55 @@ def is_discord_url(text):
 # REST 抓取（按链接拉单条消息）
 # =====================================================
 
+def _discord_id(value):
+    """Discord ID → str；None/UNSET 哨兵 → 空串"""
+    if value is None:
+        return ""
+    if type(value).__name__ == "_UNSET":
+        return ""
+    return str(value)
+
+
+def _extract_reference(ref_obj, referenced=None):
+    """从 API 消息对象提取回复引用 → 可选 reference dict
+
+    内联 referenced_message（含作者+正文）优先；只有 message_reference
+    时仅带 message_id/channel_id，由 build_parts 阶段回退抓取补全。
+    返回 {message_id, channel_id, username, content} 或 None"""
+    if not isinstance(ref_obj, dict):
+        ref_obj = {}
+    if not isinstance(referenced, dict):
+        referenced = {}
+
+    message_id = referenced.get("id") or ref_obj.get("message_id")
+    if not message_id:
+        return None
+
+    author = referenced.get("author") or {}
+
+    return {
+        "message_id": _discord_id(message_id),
+        "channel_id": _discord_id(
+            ref_obj.get("channel_id")
+            or referenced.get("channel_id")
+        ),
+        "username": (
+            author.get("global_name")
+            or author.get("username")
+            or ""
+        ),
+        "content": referenced.get("content") or "",
+    }
+
+
 def normalize_api_message(msg):
     """Discord API 消息对象 → 规范化 dict（含 message_id）
 
     供 fetch_message / fetch_channel_messages_after 复用。
-    结构：{message_id, username, channel_id, channel_name, content, embeds, attachments}
+    结构：{message_id, username, channel_id, channel_name, content,
+           embeds, attachments, reference}
+    reference 可选：{message_id, channel_id, username, content}
+    或 None（非回复消息）。
     embeds: [{title, url, image_url}]
     attachments: [{url, filename}]"""
     author = msg.get(
@@ -149,6 +196,10 @@ def normalize_api_message(msg):
         "content": msg.get("content", ""),
         "embeds": embeds,
         "attachments": attachments,
+        "reference": _extract_reference(
+            msg.get("message_reference"),
+            msg.get("referenced_message"),
+        ),
     }
 
 
@@ -563,6 +614,22 @@ def normalize_event(event, channel_name):
             "filename": getattr(file, "filename", ""),
         })
 
+    # 事件只携带被引用消息的 ID，无内联原文；
+    # 由 build_parts 阶段按 ID 回退抓取一次补全
+    ref = getattr(event, "message_reference", None)
+    reference = None
+    if (
+        ref is not None
+        and type(ref).__name__ != "_UNSET"
+        and _discord_id(getattr(ref, "message_id", None))
+    ):
+        reference = {
+            "message_id": _discord_id(getattr(ref, "message_id", None)),
+            "channel_id": _discord_id(getattr(ref, "channel_id", None)),
+            "username": "",
+            "content": "",
+        }
+
     return {
         "username": username,
         "channel_id": str(event.channel_id),
@@ -570,6 +637,7 @@ def normalize_event(event, channel_name):
         "content": getattr(event, "content", "") or "",
         "embeds": embeds,
         "attachments": attachments,
+        "reference": reference,
     }
 
 
@@ -597,6 +665,121 @@ async def _resolve_channel_name(channel_id):
 
 
 # =====================================================
+# 回复引用行（Discord 回复 → "↩ 用户名：被回复内容"）
+#
+# 实时转发 / 启动补发 / 私聊链接共用 build_parts 渲染：
+#   - REST 路径由 normalize_api_message 优先读内联 referenced_message
+#   - 事件路径只有 message_reference.message_id，回退抓取一次原文
+# 抓取失败或无可引用正文时静默跳过引用行，不影响当前消息转发。
+# =====================================================
+
+async def _fetch_reference_message(channel_id, message_id):
+    """按 ID 抓取被引用消息原文；失败返回 None（引用行 best-effort）"""
+    if not channel_id or not message_id:
+        return None
+
+    api = (
+        f"https://discord.com/api/v10/"
+        f"channels/{channel_id}/messages/{message_id}"
+    )
+
+    headers = {
+        "Authorization":
+            f"Bot {get_discord_token()}"
+    }
+
+    try:
+        async with httpx.AsyncClient(
+            proxy=_get_proxy(),
+            timeout=DISCORD_API_TIMEOUT,
+        ) as client:
+            response = await client.get(
+                api,
+                headers=headers,
+            )
+    except Exception:
+        return None
+
+    if response.status_code != 200:
+        return None
+
+    try:
+        data = response.json()
+    except Exception:
+        return None
+
+    return data if isinstance(data, dict) else None
+
+
+async def _resolve_reference(reference, fallback_channel_id):
+    """补全引用原文供渲染；只有 ID 时回退抓取一次。
+
+    返回带 username/content 的 reference；无可引用正文返回 None。
+    抓取失败静默返回 None，不影响当前消息转发。"""
+    if not reference:
+        return None
+
+    if (reference.get("content") or "").strip():
+        return reference
+
+    if reference.get("username"):
+        # 有作者但无正文（如图片回复），没有可引用的文字
+        return None
+
+    message_id = reference.get("message_id")
+    channel_id = reference.get("channel_id") or fallback_channel_id
+
+    if not message_id or not channel_id:
+        return None
+
+    raw = await _fetch_reference_message(
+        channel_id,
+        message_id,
+    )
+
+    if not raw:
+        return None
+
+    author = raw.get("author") or {}
+
+    reference["username"] = (
+        author.get("global_name")
+        or author.get("username")
+        or ""
+    )
+    reference["content"] = raw.get("content") or ""
+
+    if not (reference.get("content") or "").strip():
+        return None
+
+    return reference
+
+
+def _render_reference(reference):
+    """引用行文本：↩ 用户名：被回复内容（正文截断、压平换行）"""
+    content = (reference.get("content") or "").strip()
+
+    if not content:
+        return None
+
+    username = reference.get("username") or "unknown"
+
+    content = convert_mentions(content)
+    content, _ = parse_discord_emoji(content)
+    content = convert_mention_ids(content)
+    content = cleanup_markdown(content)
+    content = re.sub(r"\s+", " ", content).strip()
+
+    if not content:
+        return None
+
+    if len(content) > REFERENCE_TEXT_LIMIT:
+        content = content[:REFERENCE_TEXT_LIMIT] + "…"
+
+    return "↩︎ " + username + "：" + content
+
+
+# =====================================================
 # 规范化消息 → QQ 消息段（唯一一份渲染逻辑）
 # =====================================================
 
@@ -604,6 +787,8 @@ async def build_parts(message, source_label="自动转发来自"):
     """规范化消息 → (text_parts, media_items, has_content)
 
     - header（来源频道/作者）始终在 text_parts 首位
+    - 回复引用行（↩ 用户名：被回复内容）位于 header 后、正文前；
+      抓取失败时静默跳过，不进 has_content
     - 正文 + Emoji、embeds、附件统一渲染，媒体并发下载
     - 下载失败降级为文字 + 原链接
     - has_content 用于实时转发跳过空消息（仅 header 时）
@@ -627,6 +812,22 @@ async def build_parts(message, source_label="自动转发来自"):
             f"Discord [#{channel_name}] 中 [{username}]的消息："
         )
     )
+
+    # ======================
+    # 回复引用行（best-effort，失败不影响当前消息转发）
+    # ======================
+
+    reference = await _resolve_reference(
+        message.get("reference"),
+        channel_id,
+    )
+
+    if reference:
+        ref_text = _render_reference(reference)
+        if ref_text:
+            text_parts.append(
+                make_text("\n" + ref_text)
+            )
 
     has_content = False
 
