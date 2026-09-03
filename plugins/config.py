@@ -67,6 +67,11 @@ from plugins.json_io import (
 
 SETTINGS_FILE = "data/settings.json"
 
+# 转发组：固定 id + 可重命名 name + channels[]/groups[] 集合。
+# 旧配置缺省时内存归一化为默认转发组（channels/groups = 当前全局启用项），
+# 路由结果与旧的"全局启用即全量转发"完全一致；面板保存后固化落盘。
+FORWARDING_GROUP_DEFAULT_ID = "default"
+
 
 def _default_settings():
     groups = [
@@ -159,6 +164,10 @@ def _load_settings():
         _settings_cache = _default_settings()
     else:
         _settings_cache = data
+    # 转发组内存归一化（不写盘）：旧配置缺省/损坏时生成默认组，
+    # 保证路由函数始终拿到合法结构；与下方 qq_user_openids 的内存
+    # 补齐同理，绝不把归一化结果当作面板配置写回文件
+    _ensure_forwarding_groups(_settings_cache)
     _settings_cache_mtime, _settings_cache_size = mtime, size
 
     return _settings_cache
@@ -194,6 +203,131 @@ def get_active_groups():
                 active.append(str(item["openid"]))
         return active
     return list(QQ_GROUP_OPENIDS)
+
+
+# =====================================================
+# 转发组路由
+#
+# forwarding_groups 只负责"当前路由"，不管理去重游标：
+# 从转发组取消某个群只影响该频道此后转发到哪些群，
+# 不触碰 data/discord_last.json 里该频道×群已有的历史游标
+# （游标结构/生命周期由 plugins/dedup.py + plugins/history.py
+# 管理，本模块不参与）。
+#
+# 实际发送必须同时满足（两级开关）：
+#   - 频道全局 enabled（discord_channels 条目的 enabled）
+#   - 群全局 enabled（qq_group_openids 条目的 enabled）
+#   - 频道与群同属于至少一个转发组
+# =====================================================
+
+
+def _enabled_channel_ids(data):
+    """settings dict 内全局启用的频道 id 列表（转发组归一化/路由共用）"""
+    items = data.get("discord_channels")
+    if isinstance(items, list):
+        return [
+            str(item["id"])
+            for item in items
+            if item.get("enabled") and item.get("id")
+        ]
+    return [str(k) for k in DISCORD_CHANNELS]
+
+
+def _enabled_group_openids(data):
+    """settings dict 内全局启用的群 openid 列表（转发组归一化/路由共用）"""
+    items = data.get("qq_group_openids")
+    if isinstance(items, list):
+        return [
+            str(item["openid"])
+            for item in items
+            if item.get("enabled") and item.get("openid")
+        ]
+    return [str(o) for o in QQ_GROUP_OPENIDS]
+
+
+def _ensure_forwarding_groups(data):
+    """转发组内存归一化（只改内存 data，不写盘）。
+
+    - 结构合法 → 清洗保留（id 去重、字段转 str、name 缺省回退 id）
+    - 缺省/空/结构无效（旧配置升级）→ 生成默认转发组：
+      channels = 当前全部启用频道，groups = 当前全部启用群，
+      路由结果与旧的"全局启用即全量转发"完全一致。"""
+    groups = data.get("forwarding_groups")
+    if not isinstance(groups, list):
+        groups = []
+
+    normalized = []
+    seen_ids = set()
+    for item in groups:
+        if not isinstance(item, dict):
+            continue
+        gid = str(item.get("id") or "").strip()
+        if not gid or gid in seen_ids:
+            continue
+        seen_ids.add(gid)
+        normalized.append({
+            "id": gid,
+            "name": str(item.get("name") or "").strip() or gid,
+            "channels": [str(c) for c in (item.get("channels") or []) if c],
+            "groups": [str(o) for o in (item.get("groups") or []) if o],
+        })
+
+    if not normalized:
+        normalized = [{
+            "id": FORWARDING_GROUP_DEFAULT_ID,
+            "name": "转发组1",
+            "channels": _enabled_channel_ids(data),
+            "groups": _enabled_group_openids(data),
+        }]
+
+    data["forwarding_groups"] = normalized
+    return normalized
+
+
+def get_forwarding_groups():
+    """返回归一化后的转发组列表（[{id, name, channels[], groups[]}]）"""
+    return _ensure_forwarding_groups(
+        _load_settings()
+    )
+
+
+def get_groups_for_channel(channel_id):
+    """Discord 频道 → QQ 目标群 的唯一路由入口（两级开关）。
+
+    同时满足才转发：
+      - 频道全局 enabled
+      - 群全局 enabled
+      - 频道与群同属于至少一个转发组
+    不在任何转发组的频道不转发（全局启用但未勾选任何组 = 该频道暂停）。
+    返回值是去重后的 openid 列表，顺序与全局启用群一致；
+    同一群被多个转发组勾选不会重复出现（下游 inflight 判重兜底）。"""
+    data = _load_settings()
+    channel_id = str(channel_id)
+
+    enabled_channels = set(
+        _enabled_channel_ids(data)
+    )
+
+    if channel_id not in enabled_channels:
+        return []
+
+    enabled_groups = _enabled_group_openids(data)
+
+    if not enabled_groups:
+        return []
+
+    targets = set()
+    for fg in _ensure_forwarding_groups(data):
+        if channel_id not in fg["channels"]:
+            continue
+        targets.update(fg["groups"])
+
+    # 群必须全局 enabled；按启用顺序返回即天然去重
+    return [
+        group
+        for group in enabled_groups
+        if group in targets
+    ]
 
 
 def get_all_channels():

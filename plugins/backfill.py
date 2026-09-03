@@ -8,7 +8,7 @@ from nonebot.adapters.discord import Bot as DiscordBot
 
 from plugins.config import (
     get_active_channels,
-    get_active_groups,
+    get_groups_for_channel,
     get_backfill_limit,
     get_backfill_enabled,
     get_channel_filter,
@@ -85,14 +85,18 @@ async def _backfill_missed():
 
         channels = get_active_channels()
 
-        active_groups = get_active_groups()
-
-        if not channels or not active_groups:
+        if not channels:
             return
 
         limit = get_backfill_limit()
 
         for channel_id, channel_name in channels.items():
+
+            # 每个频道独立路由：只补发该频道命中转发组勾选的群
+            active_groups = get_groups_for_channel(channel_id)
+
+            if not active_groups:
+                continue
 
             try:
 

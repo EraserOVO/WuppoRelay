@@ -7,7 +7,7 @@ from nonebot.adapters.discord.event import GuildMessageCreateEvent
 
 from plugins.config import (
     get_active_channels,
-    get_active_groups,
+    get_groups_for_channel,
     get_channel_filter,
 )
 from plugins.filter import check_message_filter
@@ -70,8 +70,9 @@ async def handle(
         return
 
 
-    # 没有任何启用群时视为暂停转发，避免白下载媒体
-    active_groups = get_active_groups()
+    # 该频道没有任何目标群（全局未启用群 / 频道未勾选任何转发组）
+    # 时视为暂停转发，避免白下载媒体
+    active_groups = get_groups_for_channel(channel_id)
 
     if not active_groups:
         return

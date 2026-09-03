@@ -4,6 +4,12 @@ const SVG_TRASH = '<svg width="14" height="14" viewBox="0 0 24 24" fill="none" s
 let settings = null;
 // Discord 频道真实名称映射 {频道ID: 真实名}，由 /api/channel-names 拉取（仅展示，不写入 settings）
 let channelNames = {};
+// 转发组：当前活动组 id 持久化到 localStorage，刷新后恢复；
+// 组内成员（channels/groups）随 settings 整体保存
+const FG_STORAGE_KEY = "wuppo_active_fg";
+const MAX_FG = 10;
+let activeFgId = null;
+try { activeFgId = localStorage.getItem(FG_STORAGE_KEY); } catch (e) { activeFgId = null; }
 
 async function jget(url) {
   const r = await fetch(url);
@@ -97,7 +103,156 @@ function renderMode(mode) {
     (tips.length ? " · " + tips.join("；") : "");
 }
 
+// ---------- 转发组 ----------
+function getFgList() {
+  return (settings && settings.forwarding_groups) || [];
+}
+function getActiveFg() {
+  const list = getFgList();
+  if (!list.length) return null;
+  let fg = null;
+  if (activeFgId) {
+    for (let i = 0; i < list.length; i++) {
+      if (list[i].id === activeFgId) { fg = list[i]; break; }
+    }
+  }
+  if (!fg) {
+    // 当前 id 失效（组被删除/首次访问）：回退第一个组并固定记录
+    fg = list[0];
+    activeFgId = fg.id;
+    try { localStorage.setItem(FG_STORAGE_KEY, activeFgId); } catch (e) {}
+  }
+  return fg;
+}
+function setActiveFg(id) {
+  activeFgId = id;
+  try { localStorage.setItem(FG_STORAGE_KEY, id); } catch (e) {}
+  renderSettings();
+}
+function toggleFgMember(fg, id, field, on) {
+  // 只修改当前组的 channels/groups 集合；id 统一转字符串存储
+  if (!fg) return;
+  const idStr = String(id);
+  const arr = fg[field] || [];
+  const idx = arr.indexOf(idStr);
+  if (on && idx < 0) arr.push(idStr);
+  if (!on && idx >= 0) arr.splice(idx, 1);
+}
+function purgeFgMember(id, field) {
+  // 删除频道/群后清理所有转发组里的引用，不留悬空 ID
+  const idStr = String(id);
+  getFgList().forEach(function (fg) {
+    const arr = fg[field] || [];
+    const idx = arr.indexOf(idStr);
+    if (idx >= 0) arr.splice(idx, 1);
+  });
+}
+function renderFgTabs() {
+  const wrap = document.getElementById("fgTabs");
+  if (!wrap) return;
+  const list = getFgList();
+  getActiveFg();   // 顺带校正 activeFgId（失效则回退并持久化）
+  wrap.innerHTML = "";
+  list.forEach(function (fg) {
+    const isActive = fg.id === activeFgId;
+    const tab = document.createElement("button");
+    tab.type = "button";
+    tab.className = "fgtab" + (isActive ? " active" : "");
+    tab.dataset.kind = "fgTab";
+    tab.dataset.id = fg.id;
+    tab.textContent = fg.name;
+    tab.title = "切换到转发组「" + fg.name + "」";
+    wrap.appendChild(tab);
+    if (isActive) {
+      // 重命名/删除只对当前组可用（与 tab 并列，避免按钮嵌套）
+      const rename = document.createElement("button");
+      rename.type = "button";
+      rename.className = "fgctrl rowicon";
+      rename.dataset.kind = "fgRename";
+      rename.textContent = "✎";
+      rename.title = "重命名当前转发组（ID 不变）";
+      wrap.appendChild(rename);
+      if (list.length > 1) {
+        const del = document.createElement("button");
+        del.type = "button";
+        del.className = "fgctrl rowicon";
+        del.dataset.kind = "fgDel";
+        del.textContent = "🗑";
+        del.title = "删除当前转发组";
+        wrap.appendChild(del);
+      }
+    }
+  });
+  const add = document.createElement("button");
+  add.type = "button";
+  add.className = "fgtab-add";
+  add.id = "btnAddFg";
+  add.disabled = list.length >= MAX_FG;
+  add.title = list.length >= MAX_FG ? ("最多 " + MAX_FG + " 个转发组") : "添加转发组（空组，按需勾选成员）";
+  add.textContent = "＋ 添加转发组";
+  wrap.appendChild(add);
+}
+function addForwardingGroup() {
+  const list = getFgList();
+  if (list.length >= MAX_FG) { showAlert("添加转发组", "最多 " + MAX_FG + " 个转发组"); return; }
+  // 空组：不复制任何成员；名称自动取未占用的「转发组N」
+  let n = list.length + 1;
+  const names = {};
+  list.forEach(function (g) { names[g.name] = true; });
+  while (names["转发组" + n]) n++;
+  const fg = {
+    id: "fg_" + Date.now().toString(36) + Math.random().toString(36).slice(2, 6),
+    name: "转发组" + n,
+    channels: [],
+    groups: [],
+  };
+  list.push(fg);
+  activeFgId = fg.id;
+  try { localStorage.setItem(FG_STORAGE_KEY, fg.id); } catch (e) {}
+  saveAndReload();
+}
+let fgRenameActive = false;
+function startFgRename() {
+  const fg = getActiveFg();
+  if (!fg || fgRenameActive) return;
+  const wrap = document.getElementById("fgTabs");
+  const tabs = Array.prototype.slice.call(wrap.querySelectorAll(".fgtab"));
+  const tabBtn = tabs.find(function (b) { return b.dataset.id === fg.id; });
+  if (!tabBtn) return;
+  fgRenameActive = true;
+  const input = document.createElement("input");
+  input.type = "text";
+  input.className = "fg-rename";
+  input.value = fg.name;
+  input.style.width = "110px";
+  input.style.padding = "4px 8px";
+  input.style.fontSize = "13px";
+  tabBtn.replaceWith(input);
+  input.focus();
+  input.select();
+  let done = false;
+  const finish = function (commit) {
+    if (done) return;
+    done = true;
+    fgRenameActive = false;
+    const v = input.value.trim();
+    if (commit && v && v !== fg.name) {
+      fg.name = v;   // 只改 name，id 保持不变
+      saveAndReload();
+    } else {
+      renderSettings();
+    }
+  };
+  input.addEventListener("keydown", function (ev) {
+    if (ev.key === "Enter") { ev.preventDefault(); finish(true); }
+    else if (ev.key === "Escape") { ev.preventDefault(); finish(false); }
+  });
+  input.addEventListener("blur", function () { finish(true); });
+}
+
 function renderSettings() {
+  renderFgTabs();
+  const activeFg = getActiveFg();
   const gb = document.getElementById("groupBody");
   gb.innerHTML = "";
   settings.qq_group_openids.forEach((g, i) => {
@@ -106,7 +261,9 @@ function renderSettings() {
     // 名称缺省时回退显示身份库自动识别的群名
     const gname = g.name || identityName("groups", g.openid) || "";
     const gacc = g.qq_id || "";
+    const inFgGroup = !!(activeFg && activeFg.groups.indexOf(String(g.openid)) >= 0);
     tr.innerHTML =
+      '<td style="text-align:center"><input type="checkbox" data-kind="fgGroup" data-i="' + i + '"' + (inFgGroup ? " checked" : "") + ' title="本组转发：勾选 = 该群参与当前转发组的路由；还必须同时处于「启用」状态才会接收转发。"></td>' +
       '<td style="text-align:center"><input type="checkbox" data-kind="group" data-i="' + i + '"' + (g.enabled ? " checked" : "") + '></td>' +
       '<td style="text-align:center"><input type="checkbox" data-kind="groupIsTest" data-i="' + i + '"' + (g.is_test ? " checked" : "") + '></td>' +
       '<td>' +
@@ -122,7 +279,9 @@ function renderSettings() {
   settings.discord_channels.forEach((c, i) => {
     const tr = document.createElement("tr");
     const realName = channelNames[c.id] || "";
+    const inFgChan = !!(activeFg && activeFg.channels.indexOf(String(c.id)) >= 0);
     tr.innerHTML =
+      '<td style="text-align:center"><input type="checkbox" data-kind="fgChan" data-i="' + i + '"' + (inFgChan ? " checked" : "") + ' title="本组转发：勾选 = 该频道参与当前转发组的路由；还必须同时处于「启用」状态才会转发。"></td>' +
       '<td style="text-align:center"><input type="checkbox" data-kind="chan" data-i="' + i + '"' + (c.enabled ? " checked" : "") + '></td>' +
       '<td style="text-align:center"><input type="checkbox" data-kind="chanIsTest" data-i="' + i + '"' + (c.is_test ? " checked" : "") + '></td>' +
       '<td>' +
@@ -494,8 +653,10 @@ document.getElementById("addSave").addEventListener("click", async function () {
   if (!id) return showAlert("输入提示", cfg.idRequiredMsg);
   if (addKind === "group") {
     settings.qq_group_openids.push({openid: id, enabled: true, remark: document.getElementById("addFieldRemark").value.trim(), is_test: false});
+    toggleFgMember(getActiveFg(), id, "groups", true);   // 手动新增群 → 自动加入当前转发组
   } else if (addKind === "chan") {
     settings.discord_channels.push({id: id, name: document.getElementById("addFieldName").value.trim(), enabled: true, is_test: false});
+    toggleFgMember(getActiveFg(), id, "channels", true); // 手动新增频道 → 自动加入当前转发组
   } else if (addKind === "user") {
     settings.qq_user_openids.push({openid: id, enabled: true, remark: document.getElementById("addFieldRemark").value.trim()});
   }
@@ -537,12 +698,45 @@ document.addEventListener("click", async function (e) {
     return;
   }
   const k = btn.dataset.kind;
+  if (k === "fgTab") {
+    setActiveFg(btn.dataset.id);
+    return;
+  }
+  if (k === "fgRename") {
+    startFgRename();
+    return;
+  }
+  if (k === "fgDel") {
+    const list = getFgList();
+    if (list.length <= 1) { showAlert("删除转发组", "至少保留 1 个转发组，无法删除最后一个"); return; }
+    const fg = getActiveFg();
+    showConfirmDlg("删除转发组", "删除转发组「" + fg.name + "」将移除其频道→群路由关系，频道和群本身不受影响。确定删除？", async function () {
+      // 确认时基于最新 settings 解析，避免弹窗期间对象被替换
+      const curList = getFgList();
+      const target = curList.find(function (x) { return x.id === fg.id; });
+      if (!target) return;
+      curList.splice(curList.indexOf(target), 1);
+      if (activeFgId === fg.id) {
+        const next = curList[0] || null;
+        activeFgId = next ? next.id : null;
+        try { localStorage.setItem(FG_STORAGE_KEY, activeFgId || ""); } catch (e) {}
+      }
+      await saveAndReload();
+    }, "删除");
+    return;
+  }
+  if (btn.id === "btnAddFg") {
+    addForwardingGroup();
+    return;
+  }
   if (k === "groupDel") {
     const idx = Number(btn.dataset.i);
     const g = settings.qq_group_openids[idx];
     const label = (g.name || "").trim() || (g.remark || "").trim() || identityName("groups", g.openid) || g.openid;
+    const delId = g.openid;
     showConfirmDlg("删除群", "确定要删除群「" + label + "」吗？", async function () {
       settings.qq_group_openids.splice(idx, 1);
+      purgeFgMember(delId, "groups");   // 同步清理所有转发组引用
       await saveAndReload();
     }, "删除");
   } else if (k === "userDel") {
@@ -558,8 +752,10 @@ document.addEventListener("click", async function (e) {
   } else if (k === "chanDel") {
     const idx = Number(btn.dataset.i);
     const name = settings.discord_channels[idx].name || settings.discord_channels[idx].id;
+    const delId = settings.discord_channels[idx].id;
     showConfirmDlg("删除频道", "确定要删除频道「" + name + "」吗？", async function () {
       settings.discord_channels.splice(idx, 1);
+      purgeFgMember(delId, "channels");   // 同步清理所有转发组引用
       await saveAndReload();
     }, "删除");
   } else if (btn.id === "btnAddGroup") {
@@ -736,6 +932,20 @@ document.addEventListener("change", async function (e) {
     return;
   }
   if (!el.dataset.kind) return;
+  if (el.dataset.kind === "fgChan") {
+    const idx = Number(el.dataset.i);
+    const c = settings.discord_channels[idx];
+    if (c) toggleFgMember(getActiveFg(), c.id, "channels", el.checked);
+    await saveAndReload();
+    return;
+  }
+  if (el.dataset.kind === "fgGroup") {
+    const idx = Number(el.dataset.i);
+    const g = settings.qq_group_openids[idx];
+    if (g) toggleFgMember(getActiveFg(), g.openid, "groups", el.checked);
+    await saveAndReload();
+    return;
+  }
   if (el.dataset.kind === "group") {
     settings.qq_group_openids[Number(el.dataset.i)].enabled = el.checked;
     await saveAndReload();

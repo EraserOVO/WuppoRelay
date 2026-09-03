@@ -45,6 +45,15 @@ PANEL_HOST = "127.0.0.1"
 PANEL_PORT = 8090
 BOT_PORT = 8082
 
+# ---------------- 转发组 ----------------
+# 与 plugins/config.py（bot 侧）保持一致：
+#   默认组 id=default / name=转发组1；成员 = 当前全局 enabled 的频道/群。
+# 转发组只表达"频道→群"路由关系，不参与 enabled / is_test / mode 语义。
+# 磁盘迁移在 main() 启动时一次性执行，不能放 load_settings()：
+# 测试用临时 settings 文件做"其他字段逐字节不变"断言，load 路径写盘会破坏它。
+FORWARDING_GROUP_DEFAULT_ID = "default"
+FORWARDING_GROUP_MAX = 10
+
 # ---------------- 转发模式预设 ----------------
 # 测试模式：仅启用测试群 + 测试频道
 # 转发模式：仅启用非测试群 + 非测试频道（全部测试项除外）
@@ -170,18 +179,113 @@ def _validate_settings(data):
         limit = data["backfill_limit"]
         if not isinstance(limit, int) or isinstance(limit, bool) or limit <= 0:
             return "backfill_limit 必须是正整数"
+    # 转发组结构校验：key 缺失视为合法（旧载荷/测试），存在时才逐项检查
+    if "forwarding_groups" in data:
+        fgs = data["forwarding_groups"]
+        if not isinstance(fgs, list):
+            return "forwarding_groups 必须是列表"
+        if not fgs:
+            return "forwarding_groups 至少保留 1 个转发组"
+        if len(fgs) > FORWARDING_GROUP_MAX:
+            return "forwarding_groups 最多 %d 个" % FORWARDING_GROUP_MAX
+        for fg in fgs:
+            if not isinstance(fg, dict):
+                return "forwarding_groups 的每一项必须是对象"
+            if not str(fg.get("id") or "").strip():
+                return "forwarding_groups 的每一项必须有非空 id"
+            if not isinstance(fg.get("name"), str):
+                return "forwarding_groups 的每一项 name 必须是字符串"
+            for field in ("channels", "groups"):
+                if not isinstance(fg.get(field), list):
+                    return "forwarding_groups 的 %s 必须是列表" % field
     return None
+
+
+def _normalize_forwarding_groups(data):
+    """写盘前归一化转发组（fg 缺失时零操作，兼容旧载荷/测试）。
+
+    - 每项规整为 {id, name, channels[], groups[]}，id/name 取 str
+    - channels/groups 去重并剔除已被删除的频道/群（不留悬空引用）
+    - 不按 enabled 裁剪：转发组保留路由关系，全局启用/模式切换不丢勾选"""
+    fgs = data.get("forwarding_groups")
+    if not isinstance(fgs, list) or not fgs:
+        return
+    known_channels = {
+        str(c.get("id"))
+        for c in data.get("discord_channels", [])
+        if isinstance(c, dict) and c.get("id")
+    }
+    known_groups = {
+        str(g.get("openid"))
+        for g in data.get("qq_group_openids", [])
+        if isinstance(g, dict) and g.get("openid")
+    }
+    clean = []
+    for fg in fgs:
+        if not isinstance(fg, dict):
+            continue
+        gid = str(fg.get("id") or "").strip()
+        if not gid:
+            continue
+        clean.append({
+            "id": gid,
+            "name": str(fg.get("name") or "").strip() or gid,
+            "channels": sorted({
+                str(c) for c in fg.get("channels") or []
+                if str(c) and str(c) in known_channels
+            }),
+            "groups": sorted({
+                str(g) for g in fg.get("groups") or []
+                if str(g) and str(g) in known_groups
+            }),
+        })
+    if clean:
+        data["forwarding_groups"] = clean
 
 
 def save_settings(data):
     # 备份上一版配置（任何误写/损坏都可从 settings.json.bak 恢复），
     # 再走统一原子写（唯一 tmp + os.replace，见 plugins/json_io.py）
+    _normalize_forwarding_groups(data)
     try:
         if os.path.exists(SETTINGS_FILE):
             shutil.copyfile(SETTINGS_FILE, SETTINGS_BAK)
     except Exception as exc:
         _log("备份 settings.json.bak 失败: %s" % exc)
     atomic_write_json(SETTINGS_FILE, data, indent=2)
+
+
+def migrate_forwarding_groups():
+    """磁盘一次性迁移：旧配置无 forwarding_groups 时，生成默认转发组
+    （channels/groups = 当前全局 enabled 的频道/群）并写盘固化。
+
+    与 plugins/config.py（bot 侧）的内存归一化规则一致
+    （id=default / name=转发组1 / 成员=启用项），迁移后转发行为与升级前完全一致。
+    必须在 main() 启动时执行而非 load_settings()：迁移写盘会破坏
+    test_backfill_toggle 临时文件的"其他字段逐字节不变"断言。"""
+    data = load_settings()
+    fgs = data.get("forwarding_groups")
+    if isinstance(fgs, list) and fgs:
+        return  # 已有合法转发组，无需迁移
+
+    data["forwarding_groups"] = [{
+        "id": FORWARDING_GROUP_DEFAULT_ID,
+        "name": "转发组1",
+        "channels": [
+            str(c["id"])
+            for c in data.get("discord_channels", [])
+            if isinstance(c, dict) and c.get("enabled") and c.get("id")
+        ],
+        "groups": [
+            str(g["openid"])
+            for g in data.get("qq_group_openids", [])
+            if isinstance(g, dict) and g.get("enabled") and g.get("openid")
+        ],
+    }]
+    save_settings(data)
+    fg0 = data["forwarding_groups"][0]
+    _log("转发组迁移：已生成默认「转发组1」（%d 频道 / %d 群）" % (
+        len(fg0["channels"]), len(fg0["groups"])))
 
 
 def get_qq_appid():
@@ -1224,6 +1328,13 @@ def main():
     autostart = AUTOSTART_FLAG in sys.argv
 
     _log("面板启动 autostart=%s" % autostart)
+
+    # 转发组磁盘一次性迁移（旧配置生成默认组）；失败不阻断启动，
+    # bot 侧 plugins/config.py 仍会内存归一化兜底路由
+    try:
+        migrate_forwarding_groups()
+    except Exception as exc:
+        _log("转发组迁移失败: %s" % exc)
 
     # 清理过期的 bot.pid（重启后残留 PID）
     pid = read_pid()

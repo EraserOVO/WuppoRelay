@@ -5,7 +5,7 @@ from nonebot import logger
 
 from plugins.config import (
     get_active_channels,
-    get_active_groups,
+    get_groups_for_channel,
     get_all_channels,
     get_backfill_enabled,
 )
@@ -51,9 +51,7 @@ async def api_backfill_pending():
     count 达到上限 1000 时表示"至少 1000 条"；统计失败记 -1"""
     channels = get_active_channels()
 
-    active_groups = get_active_groups()
-
-    if not channels or not active_groups:
+    if not channels:
         return {"ok": True, "total": 0, "channels": {}}
 
     last_messages = load_last_messages()
@@ -62,6 +60,14 @@ async def api_backfill_pending():
     total = 0
 
     for channel_id, channel_name in channels.items():
+
+        # 每个频道独立路由：待补发统计只覆盖该频道命中转发组的群
+        active_groups = get_groups_for_channel(channel_id)
+
+        if not active_groups:
+
+            result[channel_id] = {"name": channel_name, "count": 0}
+            continue
 
         channel_map = normalize_channel_map(
             last_messages,
@@ -133,9 +139,7 @@ async def api_backfill_clear():
     """清除待补发：把各启用频道的记录推进到最新消息 ID（不发送消息）"""
     channels = get_active_channels()
 
-    active_groups = get_active_groups()
-
-    if not channels or not active_groups:
+    if not channels:
         return {"ok": True, "cleared": 0}
 
     last_messages = load_last_messages()
@@ -143,6 +147,12 @@ async def api_backfill_clear():
     cleared = 0
 
     for channel_id in channels:
+
+        # 只清除该频道命中转发组的群的待补发
+        active_groups = get_groups_for_channel(channel_id)
+
+        if not active_groups:
+            continue
 
         channel_map = normalize_channel_map(
             last_messages,
