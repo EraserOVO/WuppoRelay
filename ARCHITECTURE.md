@@ -328,7 +328,7 @@ QQ 私聊的 `backfill on/off` 走字段级接口 `POST /api/settings/backfill-t
 
 ### 11.4 `panel/管理面板.pyw` — settings.json 写入
 
-**为什么危险：** 面板是 settings.json 的唯一正常写入方。`save_settings` 的原子替换（唯一 tmp + `os.replace`，见 `plugins/json_io.py`）保证配置不会写坏，保存前还会把上一版轮转备份为 `settings.json.bak`，误写/损坏可从 `.bak` 恢复。如果改成非原子写入，面板崩溃时可能写坏配置文件，导致 bot 启动后读不到配置。`load_settings` 里的迁移逻辑（`test_group_openid` → `is_test`）是一次性的，重复执行无害但不能删（否则旧配置用户升级后会丢失测试标记）。
+**为什么危险：** 面板是 settings.json 的唯一正常写入方。`save_settings` 的原子替换（唯一 tmp + `os.replace`，见 `plugins/json_io.py`）保证配置不会写坏，保存前还会把上一版轮转备份为 `settings.json.bak`，误写/损坏可从 `.bak` 恢复。如果改成非原子写入，面板崩溃时可能写坏配置文件，导致 bot 启动后读不到配置。`migrate_forwarding_groups`（main() 启动时执行）里的迁移逻辑（旧 `is_test` / `test_group_openid` → 「测试组」成员）是幂等的，重复执行无害但不能删（否则旧配置用户升级后会丢失测试隔离配置）。
 
 ### 11.5 `plugins/backfill.py` — 补发与去重的交叉
 

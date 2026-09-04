@@ -1,77 +1,276 @@
+  :root {
+    /* 夜间模式（默认）配色 —— 与历史版本完全一致 */
+    --bg: #1e2229;
+    --fg: #e6e8eb;
+    --muted: #8b93a1;
+    --card-bg: #272c35;
+    --card-heading: #aeb6ff;
+    --fgh3: #9aa3e0;
+    --field-bg: #1a1f27;
+    --field-border: #3a4250;
+    --field-fg: #e6e8eb;
+    --table-border: #363d49;
+    --log-bg: #16191f;
+    --panel-border: #2a3140;
+    --sec-bg: #2c3240;
+    --sec-fg: #ffffff;
+    --btn-fg: #ffffff;
+    --primary: #5865F2;
+    --primary-border: #aeb6ff;
+    --modal-bg: #1e2330;
+    --modal-border: #3a4150;
+    --tip: #ffd479;
+    --name-green: #8dc891;
+    --ok-border: #3f6b45;
+    --empty: #5a6270;
+    --pending: #e5b567;
+    --hover-fg: #ffffff;
+    --fgtab-fg: #e6e8eb;
+    --fgtab-active-fg: #e6e8eb;
+    /* 彩色状态元素（徽章/危险/警告/筛选激活）：夜间值保持原色 */
+    --badge-on-bg: #1f6f43; --badge-on-fg: #b7f7c9;
+    --badge-off-bg: #6b3b3b; --badge-off-fg: #ffc9c9;
+    --badge-warn-bg: #6b5b2e; --badge-warn-fg: #ffe9b0;
+    --danger-bg: #c0392b; --danger-fg: #ffffff;
+    --warn-bg: #d97706; --warn-fg: #ffffff;
+    --filter-active-bg: #3d5afe; --filter-active-border: #536dfe;
+  }
+  /* 日间模式：整体浅色低饱和，文字/卡片/边框/输入框/按钮同步调整 */
+  body.theme-light {
+    --bg: #f3f5f9;
+    --fg: #23272e;
+    --muted: #5a6270;
+    --card-bg: #ffffff;
+    --card-heading: #4a5fd4;
+    --fgh3: #5a6bb8;
+    --field-bg: #ffffff;
+    --field-border: #c2c8d1;
+    --field-fg: #23272e;
+    --table-border: #dfe3ea;
+    --log-bg: #f6f7fa;
+    --panel-border: #dfe3ea;
+    --sec-bg: #f0f2f6;
+    --sec-fg: #3a3f47;
+    --btn-fg: #3349b8;
+    --primary: #dbe4ff;
+    --primary-border: #b9c9f7;
+    --modal-bg: #ffffff;
+    --modal-border: #c2c8d1;
+    --tip: #8a5a00;
+    --name-green: #1b7a45;
+    --ok-border: #4fae7f;
+    --empty: #7a828e;
+    --pending: #8a5a00;
+    --hover-fg: #23272e;
+    --fgtab-fg: #23272e;
+    --fgtab-active-fg: #3349b8;
+    /* 日间：彩色状态元素整体调浅、降饱和（浅底深字，保持清晰可读） */
+    --badge-on-bg: #d5f0df; --badge-on-fg: #16703c;
+    --badge-off-bg: #fde3e0; --badge-off-fg: #b3261e;
+    --badge-warn-bg: #fdeeda; --badge-warn-fg: #7c5200;
+    --danger-bg: #ffdcd8; --danger-fg: #b3261e;
+    --warn-bg: #ffeed3; --warn-fg: #7c5200;
+    --filter-active-bg: #dbe4ff; --filter-active-border: #b9c9f7;
+  }
   * { box-sizing: border-box; }
   body {
     margin: 0; padding: 24px;
     font-family: "Microsoft YaHei", Arial, sans-serif;
-    background: #1e2229; color: #e6e8eb;
+    background: var(--bg); color: var(--fg);
   }
   h1 { font-size: 22px; margin: 0 0 4px; }
-  .sub { color: #8b93a1; font-size: 13px; margin-bottom: 20px; }
+  .sub { color: var(--muted); font-size: 13px; margin-bottom: 20px; }
   .card {
-    background: #272c35; border-radius: 10px;
+    background: var(--card-bg); border-radius: 10px;
     padding: 16px 18px; margin-bottom: 16px;
   }
-  .card h2 { font-size: 15px; margin: 0 0 12px; color: #aeb6ff; }
+  .card h2 { font-size: 15px; margin: 0 0 12px; color: var(--card-heading); }
   .row { display: flex; align-items: center; gap: 12px; flex-wrap: wrap; }
   .badge {
     padding: 4px 12px; border-radius: 20px; font-size: 13px; font-weight: bold;
   }
-  .badge.on { background: #1f6f43; color: #b7f7c9; }
-  .badge.off { background: #6b3b3b; color: #ffc9c9; }
-  .badge.warn { background: #6b5b2e; color: #ffe9b0; }
-  .pid { font-size: 13px; color: #8b93a1; }
+  .badge.on { background: var(--badge-on-bg); color: var(--badge-on-fg); }
+  .badge.off { background: var(--badge-off-bg); color: var(--badge-off-fg); }
+  .badge.warn { background: var(--badge-warn-bg); color: var(--badge-warn-fg); }
+  .pid { font-size: 13px; color: var(--muted); }
   button {
-    background: #5865F2; color: #fff; border: none; border-radius: 6px;
+    background: var(--primary); color: var(--btn-fg); border: none; border-radius: 6px;
     padding: 8px 16px; font-size: 14px; cursor: pointer;
   }
   button:hover { opacity: .9; }
-  button.sec { background: #2c3240; }
-  button.danger { background: #c0392b; }
-  button.warn { background: #d97706; }
+  button.sec { background: var(--sec-bg); color: var(--sec-fg); }
+  /* 门户链接按钮：链环图标在文本左侧，图标与文字垂直居中 */
+  button.linkbtn {
+    display: inline-flex; align-items: center; justify-content: center; gap: 6px;
+  }
+  button.linkbtn svg { flex: none; }
+  button.danger { background: var(--danger-bg); color: var(--danger-fg); }
+  button.warn { background: var(--warn-bg); color: var(--warn-fg); }
   button:disabled { opacity: .5; cursor: not-allowed; }
-  button.mode { background: #2c3240; }
   button.iconbtn {
     width: 36px; height: 36px; padding: 0;
     border-radius: 6px; font-size: 18px; line-height: 1;
+    display: inline-flex; align-items: center; justify-content: center;
   }
-  button.mode.active { background: #5865F2; border-color: #aeb6ff; }
-  button.mode.active::after { content: " ✓"; }
+  /* 顶部「关于」「主题」按钮：尺寸与「离线补发」刷新/垃圾桶图标按钮完全一致（34×34 圆角方形）；
+     排列方向对应：关于=刷新（左）、主题=垃圾桶（右），组间距与 bf-right-group 同为 6px */
+  #btnAbout, #btnTheme {
+    width: 34px; height: 34px; padding: 0;
+    border-radius: 8px;
+    display: inline-flex; align-items: center; justify-content: center;
+  }
+  #btnAbout svg, #btnTheme svg { flex: none; }
+  /* 重启面板：去掉按钮底色/边框，仅保留循环箭头图标（与「离线补发」刷新按钮同款 SVG）；与标题底部对齐（点击交互不变） */
+  #btnRestartPanel {
+    background: transparent; border: none;
+    color: var(--muted); width: auto; height: auto; padding: 0 6px;
+  }
+  #btnRestartPanel svg { flex: none; }
+  #btnRestartPanel:hover { color: var(--hover-fg); opacity: 1; }
+  /* 「关于作者」社交按钮：横向并列、圆角矩形、图标+名称、尺寸统一 */
+  #aboutModal button { padding: 10px 16px; border-radius: 8px; font-size: 14px; }
+  #aboutModal .about-social {
+    flex: 1; min-width: 0;
+    display: inline-flex; align-items: center; justify-content: center; gap: 6px;
+    padding: 10px 6px;
+  }
+  #aboutModal .about-social svg { flex: none; }
+  /* 离线补发：启用开关按钮与「开机自启」完全同款 */
+  #btnBackfillToggle {
+    display: inline-flex; align-items: center; justify-content: center; gap: 6px;
+  }
+  #btnBackfillToggle svg { flex: none; }
+  /* 离线补发第一行：紧凑排列；上限+待补发同行，待补发靠右 */
+  .bf-row { gap: 8px; align-items: center; flex-wrap: wrap; }
+  /* 「单次补发上限 条/频道」文字：字号/颜色与模式卡片说明（.pid）一致 */
+  .bf-limit-row { gap: 6px; align-items: center; }
+  .bf-limit-label { font-size: 13px; color: var(--muted); line-height: 1.4; }
+  /* 数字输入框缩小：更短更紧凑 */
+  .bf-limit-input {
+    width: 46px;
+    background: var(--field-bg); border: 1px solid var(--field-border); color: var(--field-fg);
+    border-radius: 5px; padding: 4px 6px; font-size: 13px;
+  }
+  .bf-pending-row { gap: 6px; align-items: center; margin-left: auto; }
+  /* 右侧图标按钮组：刷新+清空贴近排列（内 gap 收紧），整组推到行尾 */
+  .bf-right-group { gap: 6px; margin-left: auto; }
+  /* 「刷新」「清空」圆角方形图标按钮：尺寸一致（清空为红色、刷新复用 .sec 漏斗图标颜色） */
+  #btnBackfillRefresh, #btnBackfillClear {
+    width: 34px; height: 34px; padding: 0;
+    border-radius: 8px;
+    display: inline-flex; align-items: center; justify-content: center;
+  }
+  #btnBackfillRefresh svg, #btnBackfillClear svg { flex: none; }
   table { width: 100%; border-collapse: collapse; font-size: 14px; }
-  th, td { text-align: left; padding: 8px 6px; border-bottom: 1px solid #363d49; }
-  th { color: #8b93a1; font-weight: normal; font-size: 13px; }
+  th, td { text-align: left; padding: 8px 6px; border-bottom: 1px solid var(--table-border); }
+  th { color: var(--muted); font-weight: normal; font-size: 13px; }
   input[type=text] {
-    background: #1a1f27; border: 1px solid #3a4250; color: #e6e8eb;
+    background: var(--field-bg); border: 1px solid var(--field-border); color: var(--field-fg);
     border-radius: 5px; padding: 6px 8px; font-size: 14px; width: 100%;
   }
-  input[type=checkbox] { width: 18px; height: 18px; }
+  /* 数字输入框：隐藏自带的手动增减箭头（上下三角），保留直接输入 */
+  input[type=number]::-webkit-outer-spin-button,
+  input[type=number]::-webkit-inner-spin-button { -webkit-appearance: none; margin: 0; }
+  input[type=number] { -moz-appearance: textfield; appearance: textfield; }
+  /* 勾选框：标准 18×18（较 28×28 更紧凑，适合表格行内展示）；
+     选中态蓝色参照「开机自启」开启状态（background=--primary）；未选中保持默认样式；
+     弹窗内勾选框保留 16px（行内样式覆盖） */
+  input[type=checkbox] {
+    width: 18px; height: 18px;
+    -webkit-appearance: none; appearance: none;
+    margin: 0; vertical-align: middle;
+    background: var(--field-bg);
+    border: 1px solid var(--field-border);
+    border-radius: 4px;
+    cursor: pointer;
+  }
+  input[type=checkbox]:checked {
+    background: var(--primary);
+    border-color: var(--primary-border);
+  }
+  input[type=checkbox]:checked::after {
+    content: "";
+    display: block; width: 100%; height: 100%;
+    background: var(--btn-fg);
+    -webkit-mask: url('data:image/svg+xml;utf8,<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="black" stroke-width="3" stroke-linecap="round" stroke-linejoin="round"><polyline points="20 6 9 17 4 12"/></svg>') center / 70% no-repeat;
+    mask: url('data:image/svg+xml;utf8,<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="black" stroke-width="3" stroke-linecap="round" stroke-linejoin="round"><polyline points="20 6 9 17 4 12"/></svg>') center / 70% no-repeat;
+  }
   .mono { font-family: Consolas, monospace; font-size: 12px; }
   .log {
-    background: #16191f; border-radius: 6px; padding: 10px;
+    background: var(--log-bg); border-radius: 6px; padding: 10px;
     font-family: Consolas, monospace; font-size: 12px;
-    white-space: pre-wrap; word-break: break-all; max-height: 260px; overflow: auto;
+    white-space: pre-wrap; word-break: break-all;
+    /* 固定高度（原 260px 的 2/3），不随日志内容多少变化；超出部分滚动 */
+    height: 173px; overflow: auto;
+  }
+  /* 日志级别选择框：圆角矩形尺寸与「清空日志」按钮（.sec）外围一致（同 padding/字号/圆角） */
+  #logLevel {
+    background: var(--field-bg); border: 1px solid var(--field-border); color: var(--field-fg);
+    border-radius: 6px; padding: 8px 16px; font-size: 14px;
   }
   .addrow { display: flex; gap: 8px; margin-top: 10px; }
   .addrow input { flex: 1; }
   .addrow button { flex: none; }
-  .hint { color: #8b93a1; font-size: 12px; margin-top: 8px; }
-  .tip { color: #ffd479; font-size: 12px; }
+  .hint { color: var(--muted); font-size: 12px; margin-top: 8px; }
+  .tip { color: var(--tip); font-size: 12px; }
   .delbtn { width: 100%; }
   .cardrow { display: flex; gap: 16px; align-items: stretch; }
   .cardrow .card { flex: 1; margin-bottom: 16px; display: flex; flex-direction: column; }
+  /* 顶部卡片宽度：机器人状态:离线补发 = 6:4；
+     保留 min-width 下限（机器人 560px / 离线补发 380px）保证窄视口下按钮不换行，宽视口按比例自适应 */
+  .cardrow .card:nth-child(1) { flex: 6 1 0; min-width: 560px; }
+  .cardrow .card:nth-child(2) { flex: 4 1 0; min-width: 380px; }
+  /* 机器人状态卡控制按钮行：间距收紧以在一行容纳四按钮 */
+  .cardrow .card:nth-child(1) .row { gap: 6px; }
+  /* 开机自启按钮：与三个机器人控制按钮同排右侧，样式一致（sec），图标+文字居中 */
+  #btnAutostart {
+    display: inline-flex; align-items: center; justify-content: center; gap: 6px;
+  }
+  #btnAutostart svg { flex: none; }
+  /* √/× 图案中心与「开机自启」文字中心对齐：SVG 略向下移、控制高度 */
+  #btnAutostart svg { transform: translateY(1px); }
+  /* 开机自启/启用补发 选中态：复用「模式选择」选中按钮的选中颜色（背景/边框），不改尺寸/图标/文字 */
+  #btnAutostart[data-on="1"],
+  #btnBackfillToggle[data-on="1"] {
+    background: var(--primary);
+    border-color: var(--primary-border);
+  }
   .cardrow .card > .hint { margin-top: auto; padding-top: 8px; }
-  .cardrow .card > #autostartContent { flex: 1; display: flex; flex-direction: column; }
-  .cardrow .card > #autostartContent .hint { margin-top: auto; padding-top: 8px; }
+  /* 展开/折叠按钮：宽度与表格行内垃圾桶按钮一致（28px），纵向尺寸为当前的 60%（≈17px），
+     右侧 margin 与 td 右内边距一致，使右边缘与垃圾桶按钮右边缘对齐；
+     三角用 SVG 绘制并整体居中，折叠态旋转 90° 指向右 */
   .foldbtn {
-    background: transparent; color: #8b93a1; padding: 2px 10px;
-    font-size: 14px; border: 1px solid #3a4250; border-radius: 5px;
+    width: 28px; height: 17px; padding: 0; margin-right: 6px;
+    background: transparent; color: var(--muted);
+    border: 1px solid var(--field-border); border-radius: 5px;
+    display: inline-flex; align-items: center; justify-content: center;
   }
-  .foldbtn:hover { color: #fff; border-color: #8b93a1; }
+  .foldbtn svg { flex: none; width: 8px; height: 8px; }
+  .foldbtn.folded svg { transform: rotate(-90deg); }
+  .foldbtn:hover { color: var(--hover-fg); border-color: var(--muted); }
+  /* 卡片标题右侧问号：去掉圆圈/背景/边框，仅保留 ? 字符；中部与标题中部对齐 */
   button.hintbtn {
-    width: 20px; height: 20px; padding: 0; border-radius: 50%;
-    background: transparent; color: #8b93a1; border: 1px solid #3a4250;
-    font-size: 12px; line-height: 18px; text-align: center;
+    background: transparent; border: none;
+    color: var(--muted); padding: 0;
+    font-size: 12px; line-height: 1;
+    display: inline-flex; align-items: center; justify-content: center;
   }
-  button.hintbtn:hover { color: #fff; border-color: #8b93a1; }
-  /* 确认/提示弹窗永远在最上层（三个弹窗内联 z-index:999，同层时 addModal 因 DOM 靠后会盖住它） */
+  button.hintbtn:hover { color: var(--hover-fg); }
+  /* 二级窗口右上角圆形「×」关闭按钮：颜色复用漏斗图标（currentColor） */
+  .modal-x {
+    position: absolute; top: 8px; right: 8px;
+    width: 24px; height: 24px; padding: 0;
+    border-radius: 50%;
+    background: transparent; border: 1px solid var(--field-border);
+    color: var(--sec-fg);
+    font-size: 16px; line-height: 1;
+    display: inline-flex; align-items: center; justify-content: center;
+    cursor: pointer;
+  }
+  .modal-x:hover { color: var(--hover-fg); border-color: var(--muted); }
+  /* aboutModal 的 #aboutModal button 规则优先级更高，需重申圆角/去 padding 覆盖 */
+  #aboutModal button.modal-x { padding: 0; border-radius: 50%; }
+  /* 确认/提示弹窗永远在最上层（各弹窗内联 z-index:999，同层时靠后的弹窗会盖住它） */
   #confirmModal { z-index: 1000 !important; }
   #chanBody input[data-kind="chanName"] { width: 25%; }
   button.rowicon {
@@ -81,12 +280,28 @@
   }
   button.rowicon svg { pointer-events: none; }
   button.rowicon.filter-active {
-    background: #3d5afe;
-    border: 1px solid #536dfe;
+    background: var(--filter-active-bg);
+    border: 1px solid var(--filter-active-border);
   }
   button.rowicon.filter-active:hover {
-    background: #536dfe;
+    background: var(--filter-active-border);
   }
+
+  /* ---------- 拖拽排序（转发组 / 私聊权限 表格行） ---------- */
+  /* 最左侧“三横”拖拽手柄：窄列、鼠标悬停变色 */
+  td.drag-handle {
+    width: 28px; text-align: center;
+    color: var(--muted); cursor: grab;
+    user-select: none; -webkit-user-select: none;
+  }
+  td.drag-handle:hover { color: var(--hover-fg); }
+  td.drag-handle svg { display: block; margin: 0 auto; pointer-events: none; }
+  /* 拖动中的源行：半透明、手柄呈抓取态 */
+  tr.drag-src { opacity: .45; }
+  tr.drag-src td.drag-handle { cursor: grabbing; }
+  /* 插入位置反馈：目标行上方/下方 2px 强调线 */
+  tr.drop-before td:first-child { box-shadow: inset 0 2px 0 0 var(--primary-border); }
+  tr.drop-after td:first-child  { box-shadow: inset 0 -2px 0 0 var(--primary-border); }
 
   /* ---------- 转发组卡片 ---------- */
   .fgtabs {
@@ -94,15 +309,17 @@
     margin-bottom: 10px;
   }
   .fgtab {
-    background: #2c3240; color: #e6e8eb; border: 1px solid #3a4250;
+    background: var(--sec-bg); color: var(--fgtab-fg); border: 1px solid var(--field-border);
     border-radius: 6px; padding: 6px 14px; font-size: 13px; cursor: pointer;
     display: inline-flex; align-items: center; gap: 6px;
   }
-  .fgtab.active { background: #5865F2; border-color: #aeb6ff; }
+  .fgtab.active { background: var(--primary); border-color: var(--primary-border); color: var(--fgtab-active-fg); }
   .fgtab-add {
-    background: transparent; border: 1px dashed #3a4250; color: #8b93a1;
+    background: transparent; border: 1px dashed var(--field-border); color: var(--muted);
+    /* 与 .fgtab 相同内边距/字号：外框高度与转发组一致（虚线边框额外占 2px 高度） */
+    padding: 6px 14px; font-size: 13px;
   }
-  .fgtab-add:hover { color: #fff; border-color: #8b93a1; }
+  .fgtab-add:hover { color: var(--hover-fg); border-color: var(--muted); }
   /* 预留：转发组行内重命名输入框（app.js 阶段使用） */
   .fgtab input.fg-rename { width: 92px; padding: 3px 6px; font-size: 12px; }
   /* 预留：转发组行内 重命名/删除 图标按钮（app.js 阶段使用） */
@@ -111,26 +328,46 @@
     font-size: 12px; line-height: 1;
     display: inline-flex; align-items: center; justify-content: center;
   }
-  .fgsection { border-top: 1px solid #2a3140; padding-top: 12px; }
-  .fgsection h3 { font-size: 14px; margin: 0 0 10px; color: #aeb6ff; }
+  .fgsection { border-top: 1px solid var(--panel-border); padding-top: 12px; }
+  /* Discord 转发频道 与 QQ 接收群 之间的分隔线：下移（margin-top），粗细与其他横线一致（1px）；
+     Discord 转发频道 上方横线（本卡第一条 fgsection）略微加粗（2px） */
+  #fgBody .fgsection { border-top: 2px solid var(--panel-border); }
+  #fgBody .fgsection + .fgsection { border-top: 1px solid var(--panel-border); margin-top: 12px; }
+  .fgsection h3 { font-size: 14px; margin: 0 0 10px; color: var(--card-heading); }
   /* Discord 转发频道 / QQ 接收群 作为「转发组」的二级标题：字号更小、层级低于转发组 */
-  .fgsection h3.fgh3 { font-size: 13px; color: #9aa3e0; font-weight: normal; }
+  .fgsection h3.fgh3 { font-size: 13px; color: var(--fgh3); font-weight: normal; }
   /* 频道名称：正常状态只显示「名称 ✎」，✎ 为普通文本标记（非按钮），点击后进入编辑 */
   .chan-name {
     display: inline-flex; align-items: center; gap: 6px;
-    padding: 6px 0; color: #e6e8eb; min-height: 30px;
+    padding: 6px 0 1px; color: var(--fg); min-height: 30px;
   }
   .chan-name .chan-name-text { word-break: break-all; }
   .chan-name .chan-name-edit {
-    color: #8b93a1; cursor: pointer; font-size: 13px; user-select: none; flex: none;
+    color: var(--muted); cursor: pointer; font-size: 13px; user-select: none; flex: none;
+    display: inline-flex; align-items: center; justify-content: center;
   }
-  .chan-name .chan-name-edit:hover { color: #fff; }
+  .chan-name .chan-name-edit:hover { color: var(--hover-fg); }
   .tablewrap { overflow-x: auto; }
   .tablewrap table { min-width: 540px; }
   /* 「启用」表头弱化 */
-  th.col-muted { color: #8b93a1; }
-  /* 空成员占位提示 */
-  td.fgempty { color: #5a6270; text-align: center; padding: 14px 8px; }
+  th.col-muted { color: var(--muted); }
+  /* 三级选择窗口中的服务器/分组小标题（如「从全部可读频道新增」按 Discord 服务器分组） */
+  .sel-group-title {
+    color: var(--fgh3); font-size: 12px; font-weight: bold;
+    margin: 10px 0 4px; padding-top: 8px;
+    border-top: 1px solid var(--panel-border);
+  }
+  .sel-group-title:first-child { margin-top: 0; padding-top: 0; border-top: none; }
+  /* 空成员占位提示：colspan 全宽单元格，文字整体水平居中、单行显示；
+     行高度与对应表格数据行一致（频道行 63px / 群、白名单行 45px），上下留白均衡 */
+  tr.fgempty-row td { border-bottom: 1px solid var(--table-border); }
+  tr.fgempty-row { height: 63px; }
+  #groupBody tr.fgempty-row, #userBody tr.fgempty-row { height: 45px; }
+  td.fgempty-msg {
+    color: var(--empty);
+    text-align: center; white-space: nowrap;
+    vertical-align: middle;
+  }
   @media (max-width: 720px) {
     .fgtab { padding: 5px 10px; font-size: 12px; }
   }

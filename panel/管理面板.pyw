@@ -48,19 +48,23 @@ BOT_PORT = 8082
 # ---------------- 转发组 ----------------
 # 与 plugins/config.py（bot 侧）保持一致：
 #   默认组 id=default / name=转发组1；成员 = 当前全局 enabled 的频道/群。
-# 转发组只表达"频道→群"路由关系，不参与 enabled / is_test / mode 语义。
+#   「测试组」id=test / name=测试组，固定存在，不可删除、不可改名，计入上限。
+# 转发组只表达"频道→群"路由关系，不参与 enabled 语义；测试隔离完全由
+# 「测试组」实现，不再使用频道/QQ群条目的 is_test 属性。
 # 磁盘迁移在 main() 启动时一次性执行，不能放 load_settings()：
 # 测试用临时 settings 文件做"其他字段逐字节不变"断言，load 路径写盘会破坏它。
 FORWARDING_GROUP_DEFAULT_ID = "default"
 FORWARDING_GROUP_MAX = 10
 
-# ---------------- 转发模式预设 ----------------
-# 测试模式：仅启用测试群 + 测试频道
-# 转发模式：仅启用非测试群 + 非测试频道（全部测试项除外）
-# 自定义模式：其它任意勾选组合
-#
-# 测试/非测试由每个群/频道条目的 is_test 标记定义（面板"测试"勾选框）。
-# 测试模式需至少 1 个测试群和 1 个测试频道；转发模式需至少 1 个非测试群和 1 个非测试频道。
+# 「测试组」常量与 bot 侧 plugins/config.py 保持一致（唯一来源）
+try:
+    from plugins.config import (
+        TEST_FORWARDING_GROUP_ID,
+        TEST_FORWARDING_GROUP_NAME,
+    )
+except Exception:
+    TEST_FORWARDING_GROUP_ID = "test"
+    TEST_FORWARDING_GROUP_NAME = "测试组"
 
 # ---------------- 开机自启 ----------------
 # 通过启动文件夹里的 WuppoRelayAutostart.vbs（隐藏窗口）运行 panel/autostart.pyw，
@@ -106,23 +110,8 @@ def load_settings():
             data["qq_user_openids"] = default["qq_user_openids"]
         if not isinstance(data.get("discord_channels"), list):
             data["discord_channels"] = default["discord_channels"]
-        # 迁移：旧 test_group_openid / test_channel_id → 条目 is_test 标记（一次性）
-        legacy_g = str(data.get("test_group_openid") or "").strip()
-        legacy_c = str(data.get("test_channel_id") or "").strip()
-        if legacy_g or legacy_c:
-            changed = False
-            for g in data.get("qq_group_openids", []):
-                if isinstance(g, dict) and str(g.get("openid")) == legacy_g:
-                    g["is_test"] = True
-                    changed = True
-            for c in data.get("discord_channels", []):
-                if isinstance(c, dict) and str(c.get("id")) == legacy_c:
-                    c["is_test"] = True
-                    changed = True
-            data.pop("test_group_openid", None)
-            data.pop("test_channel_id", None)
-            if changed:
-                save_settings(data)
+        # 旧测试属性 / 模式选择 的磁盘迁移统一在 main() 启动时
+        # migrate_forwarding_groups() 一次性执行（幂等），load 路径绝不写盘。
         return data
     except Exception:
         return default
@@ -139,13 +128,15 @@ def get_default_settings():
             "backfill_enabled": True,
             "backfill_limit": 10,
             "qq_appid": "",
+            "qq_fwd_recency_limit": 1800,
+            "qq_fwd_select_timeout": 60,
         }
     groups = [
-        {"openid": str(o), "enabled": True, "remark": "", "is_test": False}
+        {"openid": str(o), "enabled": True, "remark": ""}
         for o in QQ_GROUP_OPENIDS
     ]
     channels = [
-        {"id": str(k), "name": v, "enabled": True, "is_test": False}
+        {"id": str(k), "name": v, "enabled": True}
         for k, v in DISCORD_CHANNELS.items()
     ]
     return {
@@ -155,6 +146,8 @@ def get_default_settings():
         "backfill_enabled": True,
         "backfill_limit": 10,
         "qq_appid": "",
+        "qq_fwd_recency_limit": 1800,
+        "qq_fwd_select_timeout": 60,
     }
 
 
@@ -188,25 +181,45 @@ def _validate_settings(data):
             return "forwarding_groups 至少保留 1 个转发组"
         if len(fgs) > FORWARDING_GROUP_MAX:
             return "forwarding_groups 最多 %d 个" % FORWARDING_GROUP_MAX
+        ids = set()
         for fg in fgs:
             if not isinstance(fg, dict):
                 return "forwarding_groups 的每一项必须是对象"
-            if not str(fg.get("id") or "").strip():
+            gid = str(fg.get("id") or "").strip()
+            if not gid:
                 return "forwarding_groups 的每一项必须有非空 id"
+            if gid in ids:
+                return "forwarding_groups 存在重复 id: %s" % gid
+            ids.add(gid)
             if not isinstance(fg.get("name"), str):
                 return "forwarding_groups 的每一项 name 必须是字符串"
             for field in ("channels", "groups"):
                 if not isinstance(fg.get(field), list):
                     return "forwarding_groups 的 %s 必须是列表" % field
+        # 「测试组」固定存在且不可改名，其 id 不被其他组占用
+        if TEST_FORWARDING_GROUP_ID not in ids:
+            return "forwarding_groups 必须包含「测试组」（id=%s）" % TEST_FORWARDING_GROUP_ID
+        for fg in fgs:
+            if str(fg.get("id")) == TEST_FORWARDING_GROUP_ID:
+                if fg.get("name") != TEST_FORWARDING_GROUP_NAME:
+                    return "「测试组」名称固定，不可改名"
     return None
 
 
 def _normalize_forwarding_groups(data):
-    """写盘前归一化转发组（fg 缺失时零操作，兼容旧载荷/测试）。
+    """写盘前归一化转发组（fg 缺失时仅清理 is_test，兼容旧载荷/测试）。
 
+    - 移除群/频道条目上的旧 is_test 属性（测试隔离由测试组实现）
     - 每项规整为 {id, name, channels[], groups[]}，id/name 取 str
     - channels/groups 去重并剔除已被删除的频道/群（不留悬空引用）
-    - 不按 enabled 裁剪：转发组保留路由关系，全局启用/模式切换不丢勾选"""
+    - 始终保留「测试组」：id/name 固定，空成员也保留（不可删除）
+    - 不按 enabled 裁剪：转发组保留路由关系，全局启用切换不丢勾选"""
+    # 旧测试属性一律清理（写盘后不再出现该字段）
+    for key in ("discord_channels", "qq_group_openids"):
+        for item in data.get(key, []):
+            if isinstance(item, dict):
+                item.pop("is_test", None)
+
     fgs = data.get("forwarding_groups")
     if not isinstance(fgs, list) or not fgs:
         return
@@ -239,8 +252,21 @@ def _normalize_forwarding_groups(data):
                 if str(g) and str(g) in known_groups
             }),
         })
-    if clean:
-        data["forwarding_groups"] = clean
+    # 「测试组」常驻：空成员也保留，id/name 固定
+    test_idx = next(
+        (i for i, f in enumerate(clean) if f["id"] == TEST_FORWARDING_GROUP_ID),
+        None,
+    )
+    if test_idx is None:
+        clean.append({
+            "id": TEST_FORWARDING_GROUP_ID,
+            "name": TEST_FORWARDING_GROUP_NAME,
+            "channels": [],
+            "groups": [],
+        })
+    else:
+        clean[test_idx]["name"] = TEST_FORWARDING_GROUP_NAME
+    data["forwarding_groups"] = clean
 
 
 def save_settings(data):
@@ -256,127 +282,115 @@ def save_settings(data):
 
 
 def migrate_forwarding_groups():
-    """磁盘一次性迁移：旧配置无 forwarding_groups 时，生成默认转发组
-    （channels/groups = 当前全局 enabled 的频道/群）并写盘固化。
+    """磁盘一次性迁移（幂等）：旧测试属性 →「测试组」，并确保测试组常驻。
 
-    与 plugins/config.py（bot 侧）的内存归一化规则一致
-    （id=default / name=转发组1 / 成员=启用项），迁移后转发行为与升级前完全一致。
-    必须在 main() 启动时执行而非 load_settings()：迁移写盘会破坏
-    test_backfill_toggle 临时文件的"其他字段逐字节不变"断言。"""
+    1. 旧配置无 forwarding_groups → 生成默认转发组 + 「测试组」：
+       默认组 = 当前全局 enabled 且非测试的频道/群；测试组 = 旧测试实体。
+    2. 旧 test_group_openid / test_channel_id / is_test 标记 → 并入「测试组」。
+    3. 移除群/频道条目的 is_test 属性与顶层 mode 字段（旧模式选择废弃）。
+    4. 已有「测试组」时仅并入旧测试成员、固定名称，不破坏其他组。
+
+    与 plugins/config.py（bot 侧）的内存归一化规则一致，迁移后转发行为
+    与升级前完全一致（测试/非测试分开路由）。必须在 main() 启动时执行
+    而非 load_settings()：迁移写盘会破坏 test_backfill_toggle 临时文件的
+    "其他字段逐字节不变"断言。重复执行结果不变（幂等）。"""
     data = load_settings()
+    before = json.dumps(data, sort_keys=True, ensure_ascii=False)
+
+    # 旧顶层测试键（更早版本：单测试群/单测试频道）→ is_test 标记，统一并入
+    legacy_g = str(data.get("test_group_openid") or "").strip()
+    legacy_c = str(data.get("test_channel_id") or "").strip()
+    if legacy_g or legacy_c:
+        for g in data.get("qq_group_openids", []):
+            if isinstance(g, dict) and str(g.get("openid")) == legacy_g:
+                g["is_test"] = True
+        for c in data.get("discord_channels", []):
+            if isinstance(c, dict) and str(c.get("id")) == legacy_c:
+                c["is_test"] = True
+        data.pop("test_group_openid", None)
+        data.pop("test_channel_id", None)
+
+    # 收集旧 is_test 成员；随后移除该字段（不再使用频道/群自身测试属性）
+    test_groups = {
+        str(g["openid"]) for g in data.get("qq_group_openids", [])
+        if isinstance(g, dict) and g.get("is_test") and g.get("openid")
+    }
+    test_channels = {
+        str(c["id"]) for c in data.get("discord_channels", [])
+        if isinstance(c, dict) and c.get("is_test") and c.get("id")
+    }
+    for key in ("qq_group_openids", "discord_channels"):
+        for item in data.get(key, []):
+            if isinstance(item, dict):
+                item.pop("is_test", None)
+    data.pop("mode", None)  # 旧模式选择（test/forward/custom）废弃
+
     fgs = data.get("forwarding_groups")
     if isinstance(fgs, list) and fgs:
-        return  # 已有合法转发组，无需迁移
+        # 已有转发组：只确保测试组存在并并入旧测试成员，其余组原样保留
+        fgs = [dict(f) for f in fgs if isinstance(f, dict)]
+        test_fg = next(
+            (f for f in fgs if str(f.get("id")) == TEST_FORWARDING_GROUP_ID),
+            None,
+        )
+        if test_fg is None:
+            fgs.append({
+                "id": TEST_FORWARDING_GROUP_ID,
+                "name": TEST_FORWARDING_GROUP_NAME,
+                "channels": sorted(test_channels),
+                "groups": sorted(test_groups),
+            })
+        else:
+            test_fg["name"] = TEST_FORWARDING_GROUP_NAME
+            test_fg["channels"] = sorted(
+                set(test_fg.get("channels") or []) | test_channels)
+            test_fg["groups"] = sorted(
+                set(test_fg.get("groups") or []) | test_groups)
+        data["forwarding_groups"] = fgs
+    else:
+        # 旧配置无转发组：默认转发组（非测试实体）+ 测试组（旧测试实体）
+        data["forwarding_groups"] = [
+            {
+                "id": FORWARDING_GROUP_DEFAULT_ID,
+                "name": "转发组1",
+                "channels": [
+                    str(c["id"]) for c in data.get("discord_channels", [])
+                    if isinstance(c, dict) and c.get("enabled") and c.get("id")
+                    and str(c["id"]) not in test_channels
+                ],
+                "groups": [
+                    str(g["openid"]) for g in data.get("qq_group_openids", [])
+                    if isinstance(g, dict) and g.get("enabled") and g.get("openid")
+                    and str(g["openid"]) not in test_groups
+                ],
+            },
+            {
+                "id": TEST_FORWARDING_GROUP_ID,
+                "name": TEST_FORWARDING_GROUP_NAME,
+                "channels": sorted(test_channels),
+                "groups": sorted(test_groups),
+            },
+        ]
 
-    data["forwarding_groups"] = [{
-        "id": FORWARDING_GROUP_DEFAULT_ID,
-        "name": "转发组1",
-        "channels": [
-            str(c["id"])
-            for c in data.get("discord_channels", [])
-            if isinstance(c, dict) and c.get("enabled") and c.get("id")
-        ],
-        "groups": [
-            str(g["openid"])
-            for g in data.get("qq_group_openids", [])
-            if isinstance(g, dict) and g.get("enabled") and g.get("openid")
-        ],
-    }]
+    if json.dumps(data, sort_keys=True, ensure_ascii=False) == before:
+        return  # 已迁移过，无需写盘（幂等）
+
     save_settings(data)
     fg0 = data["forwarding_groups"][0]
-    _log("转发组迁移：已生成默认「转发组1」（%d 频道 / %d 群）" % (
-        len(fg0["channels"]), len(fg0["groups"])))
+    tg = next(
+        (f for f in data["forwarding_groups"]
+         if f["id"] == TEST_FORWARDING_GROUP_ID),
+        {},
+    )
+    _log("转发组迁移：默认「%s」（%d 频道 / %d 群）；测试组（%d 频道 / %d 群）" % (
+        fg0.get("name"), len(fg0.get("channels", [])), len(fg0.get("groups", [])),
+        len(tg.get("channels", [])), len(tg.get("groups", []))))
 
 
 def get_qq_appid():
     """返回 QQ 开放平台 AppID（settings.json 的 qq_appid）；未配置返回 "" """
     data = load_settings()
     return str(data.get("qq_appid") or "").strip()
-
-
-def classify_mode(data):
-    """根据勾选状态与测试标记判断当前组合匹配哪种预设（状态推导）：
-    - 启用的恰好是全部测试群+测试频道 → test
-    - 启用的恰好是全部非测试群+非测试频道 → forward
-    - 其余 → custom"""
-    groups = data.get("qq_group_openids", [])
-    channels = data.get("discord_channels", [])
-
-    test_g = {str(g.get("openid")) for g in groups if g.get("is_test")}
-    test_c = {str(c.get("id")) for c in channels if c.get("is_test")}
-    nontest_g = {str(g.get("openid")) for g in groups if not g.get("is_test")}
-    nontest_c = {str(c.get("id")) for c in channels if not c.get("is_test")}
-
-    enabled_g = {str(g.get("openid")) for g in groups if g.get("enabled")}
-    enabled_c = {str(c.get("id")) for c in channels if c.get("enabled")}
-
-    if test_g and test_c and enabled_g == test_g and enabled_c == test_c:
-        return "test"
-
-    if nontest_g and nontest_c and enabled_g == nontest_g and enabled_c == nontest_c:
-        return "forward"
-
-    return "custom"
-
-
-def effective_mode(data):
-    """展示用模式：
-    - 用户点过「自定义模式」后，即使勾选组合仍匹配测试/转发预设，也始终显示自定义；
-    - 勾选组合不匹配任何预设时，自动落到自定义模式。
-    """
-    state = classify_mode(data)
-    if data.get("mode") == "custom":
-        return "custom"
-    return state
-
-
-def apply_mode(mode):
-    """应用模式预设，返回 (ok, msg, settings)
-    - test：启用全部测试群与测试频道（需至少 1 个测试群和 1 个测试频道）
-    - forward：启用全部非测试群与非测试频道（需至少 1 个非测试群和 1 个非测试频道）
-    - custom：不改勾选组合，仅记录为自定义模式
-    """
-    data = load_settings()
-
-    groups = data.get("qq_group_openids", [])
-    channels = data.get("discord_channels", [])
-
-    if mode == "test":
-        test_g = [g for g in groups if g.get("is_test")]
-        test_c = [c for c in channels if c.get("is_test")]
-        if not test_g or not test_c:
-            return (
-                False,
-                "测试模式需要至少 1 个测试群与 1 个测试频道（在列表中勾选\"测试\"）",
-                data,
-            )
-        for g in groups:
-            g["enabled"] = bool(g.get("is_test"))
-        for c in channels:
-            c["enabled"] = bool(c.get("is_test"))
-        data["mode"] = "test"
-    elif mode == "forward":
-        nontest_g = [g for g in groups if not g.get("is_test")]
-        nontest_c = [c for c in channels if not c.get("is_test")]
-        if not nontest_g or not nontest_c:
-            return (
-                False,
-                "转发模式需要至少 1 个非测试群与 1 个非测试频道",
-                data,
-            )
-        for g in groups:
-            g["enabled"] = not bool(g.get("is_test"))
-        for c in channels:
-            c["enabled"] = not bool(c.get("is_test"))
-        data["mode"] = "forward"
-    elif mode == "custom":
-        # 自定义模式不做任何勾选改动，仅记录选择
-        data["mode"] = "custom"
-    else:
-        return False, "未知模式", data
-
-    save_settings(data)
-    return True, "", data
 
 
 # ---------------- 机器人进程管理 ----------------
@@ -477,8 +491,9 @@ def bot_status():
             return {"running": True, "pid": pid, "managed": False}
         # 过期 pid（重启后进程已不存在）自动清理，避免被其它进程复用 PID 误判
         clear_pid()
-    if port_open(BOT_PORT):
-        return {"running": True, "pid": 0, "managed": False}
+    # 不再用端口探测判断存活：BOT_PORT 可能被其它程序（如 QQ 客户端）
+    # 占用，导致 Bot 未运行却被误判为 running、start_bot 拒绝重启。
+    # 存活只依据进程本身（_bot["proc"] 或 bot.pid）。
     return {"running": False, "pid": 0, "managed": False}
 
 
@@ -592,7 +607,7 @@ def sync_discovered_groups(data, openids=None):
         if not openid or openid in known:
             continue
         groups.append(
-            {"openid": openid, "enabled": False, "remark": "自动发现，点击启用", "is_test": False}
+            {"openid": openid, "enabled": False, "remark": "自动发现，点击启用"}
         )
         known.add(openid)
         added += 1
@@ -779,6 +794,27 @@ def bot_api_post(path, timeout=30.0):
         return None
 
 
+# 健康检查缓存：/api/status 会被多个页面（浏览器标签页/内嵌 webview）各自轮询，
+# 若每个请求都实时转发给 bot，/api/health 就会被数倍放大（曾观测到 0.3~1 秒一次）。
+# 这里做 3 秒 TTL 缓存：任意多个前端轮询源叠加，bot 的 /api/health 最多 3 秒请求一次。
+# 返回结构与实时请求完全一致，不影响前端 Bot 状态判断逻辑。
+_health_cache_lock = threading.Lock()
+_health_cache = {"ts": 0.0, "value": None}
+HEALTH_CACHE_TTL = 3.0
+
+
+def _bot_health_cached():
+    """返回 bot 健康状态；TTL 内复用缓存，防止多页面轮询打爆 bot 接口"""
+    now = time.time()
+    with _health_cache_lock:
+        if now - _health_cache["ts"] < HEALTH_CACHE_TTL:
+            return _health_cache["value"]
+        value = bot_api_get("/api/health", timeout=2.0)
+        _health_cache["ts"] = now
+        _health_cache["value"] = value
+        return value
+
+
 # ---------------- FastAPI 面板 ----------------
 from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse
@@ -813,15 +849,14 @@ def api_status():
     st = bot_status()
     health = None
     if st["running"]:
-        # bot 进程活着不代表网关连上；询问 bot 自身连接状态
-        health = bot_api_get("/api/health", timeout=2.0)
+        # bot 进程活着不代表网关连上；询问 bot 自身连接状态（带 3 秒缓存，防多页面轮询放大）
+        health = _bot_health_cached()
     settings = load_settings()
     return {
         "running": st["running"],
         "pid": st["pid"],
         "managed": st["managed"],
         "health": health,
-        "mode": effective_mode(settings),
         "autostart": get_autostart(),
         "log": log_tail(BOT_LOG),
         "stats": read_stats(),
@@ -1118,19 +1153,6 @@ async def api_registrations_review(request: Request):
     _log("注册审核 kind=%s action=%s openid=%s 加入settings=%s" % (kind, action, openid, added))
     return {"ok": True, "added": added, "settings": load_settings()}
 
-
-
-@app.post("/api/mode/apply")
-async def api_mode_apply(request: Request):
-    try:
-        body = await request.json()
-    except Exception:
-        return JSONResponse({"ok": False, "msg": "数据格式错误"}, status_code=400)
-    mode = (body or {}).get("mode")
-    ok, msg, data = apply_mode(mode)
-    if not ok:
-        return JSONResponse({"ok": False, "msg": msg}, status_code=400)
-    return {"ok": True, "mode": effective_mode(data), "settings": data}
 
 
 @app.get("/api/autostart")

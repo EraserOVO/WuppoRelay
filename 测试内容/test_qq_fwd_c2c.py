@@ -3,7 +3,7 @@
 
 私聊 relay 与群聊统一为「先指定目标，再发送下一条内容」：
 
-  relay-list            列出可转发目标群（全部已注册且 enabled，私聊不做测试/正式隔离）
+  relay-list            列出可转发目标群（全部已注册且 enabled，私聊不做测试隔离）
   relay {序号}          选择第 N 个群，静默等待下一条普通消息转发
   relay all             选择全部可用群，静默等待下一条普通消息转发
   relay / relay abc / relay 999 → 无法找到对应的转发群
@@ -11,7 +11,7 @@
   私聊专属：下一条消息若是 Discord 链接，走 fetch_message + build_parts。
 
 覆盖点：
-  1. relay-list 列出全部 enabled 群（不受测试/正式隔离、排除 disabled）
+  1. relay-list 列出全部 enabled 群（不受测试隔离、排除 disabled）
   2. relay {序号} 静默建立 pending，下一条文本转发到目标群 → 转发成功
   3. relay all 转发到全部 enabled 群
   4. 下一条为 DC 链接 → 走 fetch_message + build_parts
@@ -110,11 +110,11 @@ BOT = StubBot()
 
 
 def entries():
-    """全部已注册群：两个 enabled（一测试一正式）+ 一个 disabled"""
+    """全部已注册群：两个 enabled + 一个 disabled（私聊不区分测试/正式）"""
     return [
-        {"openid": G_A, "enabled": True, "is_test": True, "name": "测试群A"},
-        {"openid": G_B, "enabled": True, "is_test": False, "name": "正式群B"},
-        {"openid": G_DISABLED, "enabled": False, "is_test": False, "name": "停用群"},
+        {"openid": G_A, "enabled": True, "name": "测试群A"},
+        {"openid": G_B, "enabled": True, "name": "正式群B"},
+        {"openid": G_DISABLED, "enabled": False, "name": "停用群"},
     ]
 
 

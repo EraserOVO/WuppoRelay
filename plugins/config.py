@@ -72,6 +72,12 @@ SETTINGS_FILE = "data/settings.json"
 # 路由结果与旧的"全局启用即全量转发"完全一致；面板保存后固化落盘。
 FORWARDING_GROUP_DEFAULT_ID = "default"
 
+# 「测试组」：固定 id + 固定名称，不可删除、不可改名，计入转发组数量上限。
+# 测试隔离完全由它实现：加入测试组的频道/QQ群即属于测试路由，
+# 不再使用频道/QQ群自身的 is_test 属性（旧测试属性由迁移并入测试组）。
+TEST_FORWARDING_GROUP_ID = "test"
+TEST_FORWARDING_GROUP_NAME = "测试组"
+
 
 def _default_settings():
     groups = [
@@ -249,12 +255,32 @@ def _ensure_forwarding_groups(data):
     """转发组内存归一化（只改内存 data，不写盘）。
 
     - 结构合法 → 清洗保留（id 去重、字段转 str、name 缺省回退 id）
-    - 缺省/空/结构无效（旧配置升级）→ 生成默认转发组：
-      channels = 当前全部启用频道，groups = 当前全部启用群，
-      路由结果与旧的"全局启用即全量转发"完全一致。"""
+    - 缺省/空/结构无效（旧配置升级）→ 生成默认转发组 + 「测试组」：
+      默认组 = 当前全部启用且非测试的频道/群；测试组 = 旧 is_test 标记的频道/群，
+      与旧的"全局启用即全量转发（测试/非测试分开路由）"行为一致。
+    - 始终确保「测试组」存在：id 固定、名称固定，不可删除/改名。
+    - 旧 is_test 属性废弃：读取后从条目中移除，成员并入「测试组」（幂等）。"""
     groups = data.get("forwarding_groups")
     if not isinstance(groups, list):
         groups = []
+
+    # 旧测试属性 → 测试组成员（先收集，再清洗/生成，最后移除 is_test 字段）
+    legacy_test_groups = {
+        str(item["openid"])
+        for item in data.get("qq_group_openids", [])
+        if isinstance(item, dict) and item.get("is_test") and item.get("openid")
+    }
+    legacy_test_channels = {
+        str(item["id"])
+        for item in data.get("discord_channels", [])
+        if isinstance(item, dict) and item.get("is_test") and item.get("id")
+    }
+    for item in data.get("qq_group_openids", []):
+        if isinstance(item, dict):
+            item.pop("is_test", None)
+    for item in data.get("discord_channels", []):
+        if isinstance(item, dict):
+            item.pop("is_test", None)
 
     normalized = []
     seen_ids = set()
@@ -276,9 +302,33 @@ def _ensure_forwarding_groups(data):
         normalized = [{
             "id": FORWARDING_GROUP_DEFAULT_ID,
             "name": "转发组1",
-            "channels": _enabled_channel_ids(data),
-            "groups": _enabled_group_openids(data),
+            "channels": [
+                c for c in _enabled_channel_ids(data)
+                if c not in legacy_test_channels
+            ],
+            "groups": [
+                o for o in _enabled_group_openids(data)
+                if o not in legacy_test_groups
+            ],
         }]
+
+    # 确保「测试组」存在：id/name 固定；旧 is_test 成员并入（去重，幂等）
+    test_fg = next(
+        (fg for fg in normalized if fg["id"] == TEST_FORWARDING_GROUP_ID),
+        None,
+    )
+    if test_fg is None:
+        test_fg = {
+            "id": TEST_FORWARDING_GROUP_ID,
+            "name": TEST_FORWARDING_GROUP_NAME,
+            "channels": sorted(legacy_test_channels),
+            "groups": sorted(legacy_test_groups),
+        }
+        normalized.append(test_fg)
+    else:
+        test_fg["name"] = TEST_FORWARDING_GROUP_NAME  # 测试组不可改名
+        test_fg["channels"] = sorted(set(test_fg["channels"]) | legacy_test_channels)
+        test_fg["groups"] = sorted(set(test_fg["groups"]) | legacy_test_groups)
 
     data["forwarding_groups"] = normalized
     return normalized
@@ -360,6 +410,62 @@ def get_active_user_openids():
                 active.append(str(item["openid"]))
         return active
     return []
+
+
+def get_test_group_openids():
+    """返回「测试组」内的 QQ 群 openid 集合。
+
+    测试隔离完全由「测试组」实现：加入测试组的群即属于测试路由，
+    不再读取群条目的 is_test 属性。供 QQ→QQ 手动转发（qq_fwd）
+    判断目标群归属使用；缺省时返回空集合。"""
+    data = _load_settings()
+    for fg in _ensure_forwarding_groups(data):
+        if fg["id"] == TEST_FORWARDING_GROUP_ID:
+            return set(fg["groups"])
+    return set()
+
+
+# =====================================================
+# QQ→QQ 手动转发配置
+#
+# 不依赖转发组（forwarding_groups 只表达 Discord频道→QQ群 路由），
+# QQ→QQ 转发目标候选由「已注册群条目」的 enabled 与「测试组」成员关系决定。
+# =====================================================
+
+def get_qq_group_entries():
+    """返回 settings 中全部已注册 QQ 群条目（原样 dict 列表）。
+
+    仅用于枚举候选目标群（openid/name/enabled），不参与
+    Discord→QQ 权限判断；缺失/损坏时回退空列表。"""
+    data = _load_settings()
+    items = data.get("qq_group_openids")
+    if isinstance(items, list):
+        return [
+            dict(item)
+            for item in items
+            if isinstance(item, dict) and item.get("openid")
+        ]
+    return []
+
+
+def get_qq_fwd_recency_limit():
+    """“上一条消息”可接受的最大时间差（秒），默认 1800（30 分钟）"""
+    data = _load_settings()
+    try:
+        value = int(data.get("qq_fwd_recency_limit") or 1800)
+    except (TypeError, ValueError):
+        return 1800
+    return value if value > 0 else 1800
+
+
+def get_qq_fwd_select_timeout():
+    """交互选择超时（秒），默认 60；超时后该用户的待转发请求作废"""
+    data = _load_settings()
+    try:
+        value = int(data.get("qq_fwd_select_timeout") or 60)
+    except (TypeError, ValueError):
+        return 60
+    return value if value > 0 else 60
 
 
 def get_backfill_limit():

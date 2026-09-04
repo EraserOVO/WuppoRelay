@@ -14,6 +14,7 @@ from nonebot.adapters.qq.event import (
     GroupMessageCreateEvent,
 )
 
+from plugins import qq_fwd
 from plugins.config import get_active_user_openids
 from plugins.json_io import (
     load_json,
@@ -43,11 +44,6 @@ _panel_client = httpx.AsyncClient(
     trust_env=False,
 )
 
-MODE_LABELS = {
-    "test": "测试模式",
-    "forward": "转发模式",
-    "custom": "自定义模式",
-}
 
 # =====================================================
 # restart 跨进程确认
@@ -150,13 +146,15 @@ def _help_text():
         "【私聊命令】\n"
         "status 机器人状态\n"
         "restart 重启机器人\n"
-        "mode <forward/test> 转发模式/测试模式\n"
         "groups 群列表\n"
         "channels 频道列表\n"
         "users 权限列表\n"
         "backfill 补发状态\n"
         "backfill <on/off/run/clear/refresh> 开/关/触发/清空/刷新\n"
         "register {QQ号} {昵称} 用户私聊提交注册申请\n"
+        "relay-list 查看可转发群列表\n"
+        "relay {序号} 选择目标群，下一条消息转发\n"
+        "relay all 选择全部已启用群，下一条消息转发\n"
         "list 查看命令清单"
     )
 
@@ -165,7 +163,9 @@ def _group_help_text():
     return (
         "【群聊命令】\n"
         "register-group {群号} {群名称} 群内提交群注册申请\n"
-        "转发 relay 转发你最近一条消息到其他QQ群"
+        "relay-list 查看可转发的QQ群列表\n"
+        "relay {序号} 将下一条消息转发到指定QQ群\n"
+        "list 查看命令清单"
     )
 
 
@@ -193,11 +193,6 @@ async def _cmd_status():
 
     lines.append("")
 
-    mode = data.get("mode")
-    lines.append(
-        "工作模式：" + (MODE_LABELS.get(mode, mode) if mode else "未知")
-    )
-
     enabled = settings.get("backfill_enabled")
     if enabled is None:
         enabled = True
@@ -205,22 +200,6 @@ async def _cmd_status():
     lines.append("开机自启：" + ("开启" if data.get("autostart") else "关闭"))
 
     return "\n".join(lines)
-
-
-async def _cmd_mode(args):
-    mode = args[0] if args else ""
-
-    # 私聊仅允许切换转发/测试两种模式；自定义模式由管理面板设置
-    if mode not in ("test", "forward"):
-        return "用法: mode <forward/test>（转发/测试）"
-
-    data = await _panel_post(
-        "/api/mode/apply",
-        {"mode": mode},
-    )
-    if data.get("ok"):
-        return "已切换为" + MODE_LABELS[mode]
-    return data.get("msg") or "切换模式失败"
 
 
 async def _cmd_list(kind):
@@ -246,10 +225,7 @@ async def _cmd_list(kind):
             # 群/用户条目未注册时无 name，回退显示原 remark（如"自动发现，点击启用"）
             desc = str(item.get("remark") or "").strip()
         ident = str(item.get(id_key) or "?")
-        text = flag + (desc + " " if desc else "") + ident
-        if item.get("is_test"):
-            text += "（测试）"
-        lines.append(text)
+        lines.append(flag + (desc + " " if desc else "") + ident)
 
     lines.append(f"（总计{len(items)}个）")
 
@@ -357,9 +333,6 @@ async def _dispatch(cmd, args):
 
     if cmd == "status":
         return await _cmd_status()
-
-    if cmd == "mode":
-        return await _cmd_mode(args)
 
     if cmd == "groups":
         return await _cmd_list("qq_group_openids")
@@ -515,3 +488,72 @@ async def handle(
             event,
             reply
         )
+
+
+# =====================================================
+# 群内 @ 机器人的未知命令提示
+#
+# 本部署下 QQ 平台不下发 GROUP_AT_MESSAGE_CREATE 事件：@机器人的消息
+# 以「整条消息只有空文本」的 GroupMessageCreateEvent 送达（@指向与
+# @后的文字都不在 content / mentions 里，没有任何标记）。因此用该
+# 形态识别被 @，命中时回复「未知命令，输入 list 查看可用命令」，
+# 避免群里 @ 机器人后静默无响应。
+#
+# 正常文字消息、图片/语音等附件消息、@其他成员的消息、机器人自己的
+# 消息都不会是这种形态，不会误触发；该用户存在进行中的 relay 转发
+# （qq_fwd pending）时，本消息会被当作下一条转发内容消费，不提示。
+# =====================================================
+
+group_at_hint = on_message(
+    priority=10,
+    block=False
+)
+
+
+@group_at_hint.handle()
+async def handle_group_at_hint(
+    bot: Bot,
+    event: Event
+):
+
+    if not isinstance(
+        bot,
+        QQBot
+    ):
+        return
+
+    if not isinstance(
+        event,
+        GroupMessageCreateEvent
+    ):
+        return
+
+    if getattr(
+        event.author,
+        "bot",
+        False
+    ):
+        # 机器人发送的消息（含转发）不提示
+        return
+
+    msg = event.get_message()
+    segs = list(msg)
+
+    if len(segs) != 1 or segs[0].type != "text":
+        # 附件（图片/语音等）、@其他成员、表情等消息不提示
+        return
+
+    if (segs[0].data.get("text") or "").strip():
+        # 有实际文本：交给 list / relay / register-group 等命令处理
+        return
+
+    if qq_fwd.has_pending(
+        event.group_openid,
+        event.author.member_openid
+    ):
+        return
+
+    await bot.send(
+        event,
+        "未知命令，输入 list 查看可用命令"
+    )
